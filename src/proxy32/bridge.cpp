@@ -790,6 +790,8 @@ private:
     bool ready_{false};
 };
 
+void ReleaseTrackedRenderTargets() noexcept;
+
 class Bridge {
 public:
     Bridge() : config_(ReadConfig()) {
@@ -2661,6 +2663,7 @@ private:
     }
 
     void ReleaseResources() noexcept {
+        ReleaseTrackedRenderTargets();
         pending_ = {};
         resourcesReady_ = false;
         transferMode_ = TransferMode::None;
@@ -3380,6 +3383,36 @@ volatile LONG g_engineSurfaceProbeCursor = 0;
 void* volatile g_selectedEngineRenderTarget = nullptr;
 volatile LONG g_engineRenderTargetCaptureLogged = FALSE;
 
+void ReleaseTrackedRenderTargets() noexcept {
+    std::array<IDirect3DSurface9*, 64> surfaces{};
+    AcquireSRWLockExclusive(&g_renderTargetTraceLock);
+    InterlockedExchangePointer(
+        &g_selectedEngineRenderTarget, nullptr);
+    const LONG targetCount = InterlockedExchange(
+        &g_engineRenderTargetCount, 0);
+    for (LONG index = 0;
+         index < targetCount &&
+         index < static_cast<LONG>(g_engineRenderTargets.size());
+         ++index) {
+        TrackedRenderTarget& target =
+            g_engineRenderTargets[static_cast<std::size_t>(index)];
+        surfaces[static_cast<std::size_t>(index)] = target.surface;
+        target = {};
+    }
+    InterlockedExchange(&g_engineSurfaceProbeCadence, 0);
+    InterlockedExchange(&g_engineSurfaceProbeCursor, 0);
+    InterlockedExchange(&g_engineRenderTargetCaptureLogged, FALSE);
+    ReleaseSRWLockExclusive(&g_renderTargetTraceLock);
+
+    // Release outside the registry lock in case a driver callback re-enters
+    // bridge code while the final surface reference is being destroyed.
+    for (IDirect3DSurface9* surface : surfaces) {
+        if (surface != nullptr) {
+            surface->Release();
+        }
+    }
+}
+
 
 HRESULT STDMETHODCALLTYPE HookCreateDevice(
     IDirect3D9* self, UINT adapter, D3DDEVTYPE deviceType,
@@ -3503,7 +3536,9 @@ bool InstallAppLocalImplementationHooks(
     void* drawIndexedPrimitiveTarget, void* drawPrimitiveUpTarget,
     void* drawIndexedPrimitiveUpTarget, void* setIndicesTarget,
     void* setRenderTargetTarget, void* stretchRectTarget) noexcept {
-    if (resetTarget == nullptr || presentTarget == nullptr) {
+    const bool requireSetIndices = D3D9ExCompatibilityRequested();
+    if (resetTarget == nullptr || presentTarget == nullptr ||
+        (requireSetIndices && setIndicesTarget == nullptr)) {
         return false;
     }
 
@@ -3516,6 +3551,7 @@ bool InstallAppLocalImplementationHooks(
     auto fail = [&](const char* event, MH_STATUS status) {
         g_appLocalReset = nullptr;
         g_appLocalPresent = nullptr;
+        g_appLocalSetIndices = nullptr;
         ReleaseSRWLockExclusive(&g_appLocalHookLock);
         GetBridge().LogHookStatus(
             "ERROR", event, MH_StatusToString(status));
@@ -3545,14 +3581,32 @@ bool InstallAppLocalImplementationHooks(
         return fail("app_local_present_hook_failed", status);
     }
 
+    if (requireSetIndices) {
+        status = MH_CreateHook(
+            setIndicesTarget,
+            reinterpret_cast<void*>(&HookAppLocalSetIndices),
+            reinterpret_cast<void**>(&g_appLocalSetIndices));
+        if (status != MH_OK) {
+            MH_RemoveHook(presentTarget);
+            MH_RemoveHook(resetTarget);
+            return fail("app_local_set_indices_hook_failed", status);
+        }
+    }
+
     status = MH_QueueEnableHook(resetTarget);
     if (status == MH_OK) {
         status = MH_QueueEnableHook(presentTarget);
+    }
+    if (status == MH_OK && requireSetIndices) {
+        status = MH_QueueEnableHook(setIndicesTarget);
     }
     if (status == MH_OK) {
         status = MH_ApplyQueued();
     }
     if (status != MH_OK) {
+        if (requireSetIndices) {
+            MH_RemoveHook(setIndicesTarget);
+        }
         MH_RemoveHook(presentTarget);
         MH_RemoveHook(resetTarget);
         return fail("app_local_hook_enable_failed", status);
@@ -3602,11 +3656,18 @@ bool InstallAppLocalImplementationHooks(
         reinterpret_cast<void*>(&HookAppLocalDrawIndexedPrimitiveUp),
         reinterpret_cast<void**>(&g_appLocalDrawIndexedPrimitiveUp),
         "app_local_draw_indexed_up_probe_failed");
-    installDiagnosticHook(
-        setIndicesTarget,
-        reinterpret_cast<void*>(&HookAppLocalSetIndices),
-        reinterpret_cast<void**>(&g_appLocalSetIndices),
-        "app_local_set_indices_probe_failed");
+    if (!requireSetIndices) {
+        installDiagnosticHook(
+            setIndicesTarget,
+            reinterpret_cast<void*>(&HookAppLocalSetIndices),
+            reinterpret_cast<void**>(&g_appLocalSetIndices),
+            "app_local_set_indices_probe_failed");
+    } else {
+        GetBridge().LogHookStatus(
+            "INFO", "app_local_set_indices_required",
+            "Managed index-buffer wrappers are unwrapped by a required "
+            "SetIndices implementation hook.");
+    }
     installDiagnosticHook(
         setRenderTargetTarget,
         reinterpret_cast<void*>(&HookAppLocalSetRenderTarget),
@@ -3665,22 +3726,31 @@ void PatchSwapChain(IDirect3DSwapChain9* swapChain) noexcept {
     }
 }
 
-void PatchDevice(
+bool PatchDevice(
     IDirect3DDevice9* device, bool hasEx = false,
     bool translateManagedResources = false) noexcept {
     if (device == nullptr) {
-        return;
+        return false;
     }
     void** vtable = *reinterpret_cast<void***>(device);
     const bool lateHooksActive =
         InterlockedCompareExchange(
             &g_lateHooksActive, FALSE, FALSE) != FALSE;
-    const bool implementationHooksActive =
-        lateHooksActive ||
+    const bool appLocalHooksActive = !lateHooksActive &&
         InstallAppLocalImplementationHooks(
             vtable[16], vtable[17], vtable[43], vtable[42], vtable[81],
             vtable[82], vtable[83], vtable[84], vtable[104],
             vtable[37], vtable[34]);
+    const bool implementationHooksActive =
+        lateHooksActive || appLocalHooksActive;
+    if (translateManagedResources &&
+        (!appLocalHooksActive || g_appLocalSetIndices == nullptr)) {
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9ex_required_hooks_missing",
+            "D3D9Ex compatibility was rejected because the required "
+            "app-local SetIndices unwrapping hook is unavailable.");
+        return false;
+    }
     AcquireSRWLockExclusive(&g_hookLock);
     DeviceVtableRecord* selected = nullptr;
     for (DeviceVtableRecord& record : g_deviceRecords) {
@@ -3768,6 +3838,7 @@ void PatchDevice(
         PatchSwapChain(defaultSwapChain);
         defaultSwapChain->Release();
     }
+    return selected != nullptr;
 }
 
 void PatchD3D9(IDirect3D9* direct3D, bool hasEx) noexcept {
@@ -4026,12 +4097,17 @@ HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(
         return D3DERR_INVALIDCALL;
     }
     ForceHighQualitySource(parameters);
-    const HRESULT result = record.createDeviceEx(
+    HRESULT result = record.createDeviceEx(
         self, adapter, deviceType, focusWindow, behaviorFlags, parameters,
         fullscreenMode, output);
-    if (SUCCEEDED(result) && output != nullptr) {
-        PatchDevice(
-            *output, true, D3D9ExCompatibilityRequested());
+    const bool compatibilityRequested =
+        D3D9ExCompatibilityRequested();
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr &&
+        !PatchDevice(*output, true, compatibilityRequested) &&
+        compatibilityRequested) {
+        (*output)->Release();
+        *output = nullptr;
+        result = D3DERR_NOTAVAILABLE;
     }
     return result;
 }
@@ -4116,6 +4192,7 @@ SRWLOCK g_managedIndexRegistryLock = SRWLOCK_INIT;
 std::array<ManagedIndexBufferCompat*, 64>
     g_managedIndexBuffers{};
 volatile LONG g_nextManagedIndexDebugId = 0;
+volatile LONG g_managedIndexLifecycleSequence = 0;
 
 class ManagedIndexBufferCompat final : public IDirect3DIndexBuffer9 {
 public:
@@ -4143,7 +4220,10 @@ public:
         }
         ReleaseSRWLockExclusive(&g_managedIndexRegistryLock);
         std::ostringstream message;
-        message << "id=" << debugId_
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
                 << " wrapper=0x" << std::hex
                 << reinterpret_cast<std::uintptr_t>(this)
                 << " inner=0x"
@@ -4172,23 +4252,39 @@ public:
         if (interfaceId == kManagedIndexBufferInner) {
             *output = inner_;
             inner_->AddRef();
+            const LONG ordinal = InterlockedIncrement(
+                &innerQueryCount_);
+            if (ordinal <= 8) {
+                std::ostringstream message;
+                message << "sequence="
+                        << InterlockedIncrement(
+                               &g_managedIndexLifecycleSequence)
+                        << " id=" << debugId_
+                        << " ordinal=" << ordinal;
+                GetBridge().LogHookStatus(
+                    "INFO",
+                    "d3d9ex_managed_index_lifecycle_unwrap",
+                    message.str());
+            }
             return S_OK;
         }
         return E_NOINTERFACE;
     }
 
     ULONG STDMETHODCALLTYPE AddRef() override {
-        return static_cast<ULONG>(
-            InterlockedIncrement(&references_));
+        return AddReference("add_ref");
     }
 
     ULONG STDMETHODCALLTYPE Release() override {
-        const LONG remaining = InterlockedDecrement(&references_);
-        if (remaining == 0) {
-            delete this;
-            return 0;
-        }
-        return static_cast<ULONG>(remaining);
+        return ReleaseReference("release");
+    }
+
+    ULONG RetainForSnapshot() noexcept {
+        return AddReference("snapshot_add_ref");
+    }
+
+    ULONG ReleaseFromSnapshot() noexcept {
+        return ReleaseReference("snapshot_release");
     }
 
     HRESULT STDMETHODCALLTYPE GetDevice(
@@ -4235,8 +4331,9 @@ public:
         suppressNextUnlock_ = false;
         const HRESULT result =
             inner_->Lock(offset, size, data, flags);
-        if (SUCCEEDED(result) && data != nullptr &&
-            *data != nullptr && offset <= shadow_.size()) {
+        const bool dataReturned =
+            SUCCEEDED(result) && data != nullptr && *data != nullptr;
+        if (dataReturned && offset <= shadow_.size()) {
             lockedOffset_ = offset;
             lockedSize_ = size != 0
                 ? (std::min)(
@@ -4256,21 +4353,28 @@ public:
                     "INFO", "d3d9ex_managed_index_lock",
                     message.str());
             }
-        } else {
+        } else if (SUCCEEDED(result)) {
             lockedData_ = nullptr;
             lockedOffset_ = 0;
             lockedSize_ = 0;
         }
-        if (InterlockedIncrement(&lockLogCount_) <= 8) {
+        const LONG ordinal = InterlockedIncrement(&lockLogCount_);
+        if (ordinal <= 8 || FAILED(result)) {
             std::ostringstream message;
-            message << "id=" << debugId_
+            message << "sequence="
+                    << InterlockedIncrement(
+                           &g_managedIndexLifecycleSequence)
+                    << " id=" << debugId_
+                    << " ordinal=" << ordinal
                     << " offset=" << offset
                     << " size=" << size
                     << " flags=0x" << std::hex << flags
                     << " HRESULT=0x"
                     << static_cast<std::uint32_t>(result)
                     << std::dec << " data="
-                    << (data != nullptr && *data != nullptr ? 1 : 0);
+                    << (dataReturned ? 1 : 0)
+                    << " tracked_lock="
+                    << (lockedData_ != nullptr ? 1 : 0);
             GetBridge().LogHookStatus(
                 SUCCEEDED(result) ? "INFO" : "ERROR",
                 "d3d9ex_managed_index_lifecycle_lock",
@@ -4357,19 +4461,131 @@ public:
         return shadowReady_;
     }
 
-    bool MarkSetIndicesLogged() noexcept {
-        return InterlockedCompareExchange(
-            &setIndicesLogged_, TRUE, FALSE) == FALSE;
-    }
-
-private:
-    void LogUnlockLifecycle(
-        HRESULT result, bool suppressed) noexcept {
-        if (InterlockedIncrement(&unlockLogCount_) > 8) {
+    void LogSetIndicesLifecycle(
+        HRESULT result, bool unwrapped) noexcept {
+        const LONG ordinal = InterlockedIncrement(&setIndicesCount_);
+        if (ordinal > 8 && SUCCEEDED(result)) {
             return;
         }
         std::ostringstream message;
-        message << "id=" << debugId_
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " ordinal=" << ordinal
+                << " unwrapped=" << (unwrapped ? 1 : 0)
+                << " HRESULT=0x" << std::hex << std::uppercase
+                << static_cast<std::uint32_t>(result);
+        GetBridge().LogHookStatus(
+            SUCCEEDED(result) && unwrapped ? "INFO" : "ERROR",
+            "d3d9ex_managed_index_lifecycle_set_indices",
+            message.str());
+    }
+
+    void LogResetSnapshot(
+        const char* phase, HRESULT result) noexcept {
+        LogLifecycleState(phase, result);
+    }
+
+private:
+    ULONG AddReference(const char* operation) noexcept {
+        const LONG remaining = InterlockedIncrement(&references_);
+        const LONG ordinal = InterlockedIncrement(&addRefCount_);
+        LogReferenceLifecycle(
+            operation, ordinal, remaining, false);
+        return static_cast<ULONG>(remaining);
+    }
+
+    ULONG ReleaseReference(const char* operation) noexcept {
+        AcquireSRWLockExclusive(&g_managedIndexRegistryLock);
+        const LONG remaining = InterlockedDecrement(&references_);
+        if (remaining == 0) {
+            InterlockedCompareExchangePointer(
+                &g_managedIndexBuffer, nullptr, this);
+            for (auto& buffer : g_managedIndexBuffers) {
+                if (buffer == this) {
+                    buffer = nullptr;
+                    break;
+                }
+            }
+        }
+        ReleaseSRWLockExclusive(&g_managedIndexRegistryLock);
+        const LONG ordinal = InterlockedIncrement(&releaseCount_);
+        LogReferenceLifecycle(
+            operation, ordinal, remaining, remaining == 0);
+        if (remaining == 0) {
+            delete this;
+            return 0;
+        }
+        return static_cast<ULONG>(remaining);
+    }
+
+    void LogReferenceLifecycle(
+        const char* operation, LONG ordinal, LONG remaining,
+        bool force) noexcept {
+        if (!force && ordinal > 16) {
+            return;
+        }
+        std::ostringstream message;
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " operation=" << operation
+                << " ordinal=" << ordinal
+                << " references=" << remaining;
+        GetBridge().LogHookStatus(
+            remaining >= 0 ? "INFO" : "ERROR",
+            "d3d9ex_managed_index_lifecycle_reference",
+            message.str());
+    }
+
+    void LogLifecycleState(
+        const char* phase, HRESULT result) noexcept {
+        std::ostringstream message;
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " phase=" << phase
+                << " references="
+                << InterlockedCompareExchange(&references_, 0, 0)
+                << " locks="
+                << InterlockedCompareExchange(&lockLogCount_, 0, 0)
+                << " unlocks="
+                << InterlockedCompareExchange(&unlockLogCount_, 0, 0)
+                << " set_indices="
+                << InterlockedCompareExchange(&setIndicesCount_, 0, 0)
+                << " unwraps="
+                << InterlockedCompareExchange(&innerQueryCount_, 0, 0)
+                << " add_refs="
+                << InterlockedCompareExchange(&addRefCount_, 0, 0)
+                << " releases="
+                << InterlockedCompareExchange(&releaseCount_, 0, 0)
+                << " locked=" << (lockedData_ != nullptr ? 1 : 0)
+                << " shadow_ready=" << (shadowReady_ ? 1 : 0)
+                << " suppress_unlock="
+                << (suppressNextUnlock_ ? 1 : 0)
+                << " HRESULT=0x" << std::hex << std::uppercase
+                << static_cast<std::uint32_t>(result);
+        GetBridge().LogHookStatus(
+            FAILED(result) ? "ERROR" : "INFO",
+            "d3d9ex_managed_index_lifecycle_state",
+            message.str());
+    }
+
+    void LogUnlockLifecycle(
+        HRESULT result, bool suppressed) noexcept {
+        const LONG ordinal = InterlockedIncrement(&unlockLogCount_);
+        if (ordinal > 8 && SUCCEEDED(result)) {
+            return;
+        }
+        std::ostringstream message;
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " ordinal=" << ordinal
                 << " HRESULT=0x" << std::hex
                 << static_cast<std::uint32_t>(result)
                 << std::dec << " shadow_ready="
@@ -4382,16 +4598,7 @@ private:
     }
 
     ~ManagedIndexBufferCompat() {
-        InterlockedCompareExchangePointer(
-            &g_managedIndexBuffer, nullptr, this);
-        AcquireSRWLockExclusive(&g_managedIndexRegistryLock);
-        for (auto& buffer : g_managedIndexBuffers) {
-            if (buffer == this) {
-                buffer = nullptr;
-                break;
-            }
-        }
-        ReleaseSRWLockExclusive(&g_managedIndexRegistryLock);
+        LogLifecycleState("destroy", S_OK);
         inner_->Release();
     }
 
@@ -4407,8 +4614,27 @@ private:
     bool suppressNextUnlock_{false};
     volatile LONG lockLogCount_{0};
     volatile LONG unlockLogCount_{0};
-    volatile LONG setIndicesLogged_{FALSE};
+    volatile LONG setIndicesCount_{0};
+    volatile LONG innerQueryCount_{0};
+    volatile LONG addRefCount_{0};
+    volatile LONG releaseCount_{0};
 };
+
+void LogManagedIndexSetIndicesLifecycle(
+    IDirect3DIndexBuffer9* indexBuffer, HRESULT result,
+    bool unwrapped) noexcept {
+    if (indexBuffer == nullptr) {
+        return;
+    }
+    AcquireSRWLockShared(&g_managedIndexRegistryLock);
+    for (ManagedIndexBufferCompat* buffer : g_managedIndexBuffers) {
+        if (static_cast<IDirect3DIndexBuffer9*>(buffer) == indexBuffer) {
+            buffer->LogSetIndicesLifecycle(result, unwrapped);
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_managedIndexRegistryLock);
+}
 
 void PrepareManagedIndexBuffersForReset() noexcept {
     std::array<ManagedIndexBufferCompat*, 64> buffers{};
@@ -4417,7 +4643,7 @@ void PrepareManagedIndexBuffersForReset() noexcept {
          index < g_managedIndexBuffers.size(); ++index) {
         buffers[index] = g_managedIndexBuffers[index];
         if (buffers[index] != nullptr) {
-            buffers[index]->AddRef();
+            buffers[index]->RetainForSnapshot();
         }
     }
     ReleaseSRWLockShared(&g_managedIndexRegistryLock);
@@ -4434,13 +4660,15 @@ void PrepareManagedIndexBuffersForReset() noexcept {
         ++registered;
         locked += buffer->IsLocked() ? 1U : 0U;
         shadowed += buffer->HasShadow() ? 1U : 0U;
+        buffer->LogResetSnapshot("before_prepare", S_OK);
         const HRESULT result = buffer->PrepareForReset();
+        buffer->LogResetSnapshot("after_prepare", result);
         if (result == S_OK) {
             ++prepared;
         } else if (FAILED(result) && SUCCEEDED(failure)) {
             failure = result;
         }
-        buffer->Release();
+        buffer->ReleaseFromSnapshot();
     }
     std::ostringstream message;
     message << "registered=" << registered
@@ -4461,7 +4689,7 @@ void RestoreManagedIndexBuffersAfterReset() noexcept {
          index < g_managedIndexBuffers.size(); ++index) {
         buffers[index] = g_managedIndexBuffers[index];
         if (buffers[index] != nullptr) {
-            buffers[index]->AddRef();
+            buffers[index]->RetainForSnapshot();
         }
     }
     ReleaseSRWLockShared(&g_managedIndexRegistryLock);
@@ -4476,13 +4704,15 @@ void RestoreManagedIndexBuffersAfterReset() noexcept {
         }
         ++registered;
         shadowed += buffer->HasShadow() ? 1U : 0U;
+        buffer->LogResetSnapshot("before_restore", S_OK);
         const HRESULT result = buffer->RestoreAfterReset();
+        buffer->LogResetSnapshot("after_restore", result);
         if (result == S_OK) {
             ++restored;
         } else if (FAILED(result) && SUCCEEDED(failure)) {
             failure = result;
         }
-        buffer->Release();
+        buffer->ReleaseFromSnapshot();
     }
     std::ostringstream message;
     message << "registered=" << registered
@@ -4988,12 +5218,19 @@ bool GetSelectedEngineRenderTarget(
         return false;
     }
     *outputSurface = nullptr;
-    auto* const selected =
+    ComPtr<IDirect3DSurface9> selected;
+    AcquireSRWLockShared(&g_renderTargetTraceLock);
+    auto* const selectedPointer =
         static_cast<IDirect3DSurface9*>(
             InterlockedCompareExchangePointer(
                 &g_selectedEngineRenderTarget,
                 nullptr, nullptr));
-    if (selected == nullptr) {
+    if (selectedPointer != nullptr) {
+        selectedPointer->AddRef();
+        selected.Attach(selectedPointer);
+    }
+    ReleaseSRWLockShared(&g_renderTargetTraceLock);
+    if (!selected) {
         return false;
     }
     ComPtr<IDirect3DDevice9> surfaceDevice;
@@ -5002,8 +5239,7 @@ bool GetSelectedEngineRenderTarget(
         surfaceDevice.Get() != device) {
         return false;
     }
-    selected->AddRef();
-    *outputSurface = selected;
+    *outputSurface = selected.Detach();
     return true;
 }
 
@@ -5070,9 +5306,22 @@ bool ProbeNextEngineRenderTarget(
         return false;
     }
 
-    InterlockedExchangePointer(
-        &g_selectedEngineRenderTarget,
-        candidate.Get());
+    bool stillTracked = false;
+    AcquireSRWLockShared(&g_renderTargetTraceLock);
+    for (const TrackedRenderTarget& registryEntry :
+         g_engineRenderTargets) {
+        if (registryEntry.device == device &&
+            registryEntry.surface == candidate.Get()) {
+            InterlockedExchangePointer(
+                &g_selectedEngineRenderTarget, candidate.Get());
+            stillTracked = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_renderTargetTraceLock);
+    if (!stillTracked) {
+        return false;
+    }
     if (InterlockedCompareExchange(
             &g_engineRenderTargetCaptureLogged,
             TRUE, FALSE) == FALSE) {
@@ -5400,8 +5649,11 @@ HRESULT STDMETHODCALLTYPE HookAppLocalSetIndices(
         inner != nullptr) {
         effectiveBuffer = inner.Get();
     }
+    const bool unwrapped = effectiveBuffer != indexBuffer;
     const HRESULT result =
         g_appLocalSetIndices(self, effectiveBuffer);
+    LogManagedIndexSetIndicesLifecycle(
+        indexBuffer, result, unwrapped);
     if (indexBuffer == InterlockedCompareExchangePointer(
             &g_managedIndexBuffer, nullptr, nullptr)) {
         D3DINDEXBUFFER_DESC description{};

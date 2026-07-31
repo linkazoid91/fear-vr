@@ -113,8 +113,8 @@ endif()
 add_test(NAME vr_menu_model COMMAND test_vr_menu_model)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND TARGET fearvr-proxy)
-  # Isolierter M2-Producer: Der echte System-Import bleibt d3d9.lib; erst
-  # nach dem Link wird ausschließlich neben diese Test-EXE der Proxy kopiert.
+  # Isolated M2 producer: the system import remains d3d9.lib. The proxy is
+  # copied only beside this test executable after linking.
   add_executable(d3d9_test_producer d3d9_test_producer.cpp)
   target_link_libraries(d3d9_test_producer PRIVATE
     fearvr-warnings
@@ -136,15 +136,44 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND TARGET fearvr-proxy)
   set_tests_properties(
     d3d9ex_compat_smoke PROPERTIES LABELS "d3d9;gpu;compatibility"
   )
+  add_test(
+    NAME d3d9ex_compat_present_ex_smoke
+    COMMAND d3d9_test_producer
+      -fearvr-d3d9ex-compat
+      --compat-smoke
+      --present-ex
+  )
+  set_tests_properties(
+    d3d9ex_compat_present_ex_smoke
+    PROPERTIES LABELS "d3d9;gpu;compatibility"
+  )
+  add_test(
+    NAME d3d9ex_compat_swapchain_present_smoke
+    COMMAND d3d9_test_producer
+      -fearvr-d3d9ex-compat
+      --compat-smoke
+      --swapchain-present
+  )
+  set_tests_properties(
+    d3d9ex_compat_swapchain_present_smoke
+    PROPERTIES LABELS "d3d9;gpu;compatibility"
+  )
 
-  # Separates Ausgabeverzeichnis ohne lokalen d3d9.dll-Proxy: simuliert den
-  # archcfg-Loader, der die eindeutig benannte Bridge lädt und die EXE-IAT
-  # patcht, während Windows' System-d3d9 bereits importiert ist.
+  # A separate output directory without a local d3d9.dll proxy simulates the
+  # archcfg loader loading the uniquely named bridge and patching the EXE IAT
+  # after Windows has already imported the system d3d9 library.
   add_executable(iat_hook_test iat_hook_test.cpp)
   target_link_libraries(iat_hook_test PRIVATE fearvr-warnings d3d9)
   add_dependencies(iat_hook_test fearvr-proxy)
   set_target_properties(iat_hook_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/iat-test"
+  )
+  add_test(
+    NAME d3d9_iat_hook
+    COMMAND iat_hook_test "$<TARGET_FILE:fearvr-proxy>"
+  )
+  set_tests_properties(
+    d3d9_iat_hook PROPERTIES LABELS "d3d9;gpu;compatibility"
   )
 
   # Simulates Retail's early app-local proxy load, then initializes the

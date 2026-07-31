@@ -801,6 +801,7 @@ int main(int argumentCount, char** arguments) {
     bool beforeResetPixelPassed = false;
     bool afterResetPixelPassed = false;
     bool compatibilityFailure = false;
+    HRESULT firstFrameFailure = D3D_OK;
     bool running = true;
     for (std::uint64_t frame = 1; running && frame <= frameLimit; ++frame) {
         running = PumpMessages();
@@ -937,6 +938,9 @@ int main(int argumentCount, char** arguments) {
             Sleep(10);
             continue;
         }
+        if (FAILED(result) && SUCCEEDED(firstFrameFailure)) {
+            firstFrameFailure = result;
+        }
         if (FAILED(result)) {
             std::fprintf(stderr,
                          "Frame %llu failed: HRESULT=0x%08lX\n",
@@ -978,6 +982,13 @@ int main(int argumentCount, char** arguments) {
     DestroyWindow(window);
     UnregisterClassW(className, instance);
     std::printf("M2 D3D9 producer stopped.\n");
+    if (FAILED(firstFrameFailure)) {
+        std::fprintf(
+            stderr,
+            "D3D9 frame processing failed: HRESULT=0x%08lX\n",
+            static_cast<unsigned long>(firstFrameFailure));
+        return 15;
+    }
     if (options.compatibilitySmoke &&
         (!beforeResetPixelPassed || !afterResetPixelPassed ||
          compatibilityFailure)) {

@@ -33,6 +33,27 @@ The previous assumption that FEAR necessarily leaves this particular lock
 outstanding across reset has been rejected by the first pre-reset snapshot run:
 it reported `prepared=0`.
 
+## Recovery hardening prepared on 2026-07-31
+
+The recovered branch now records a single sequence across each managed index
+wrapper's creation, inner-buffer unwraps, reference changes, Lock/Unlock calls,
+SetIndices calls, reset snapshots, and destruction. Reset snapshots include the
+event totals and live lock/shadow state, so a wrapper released or replaced
+before reset can be distinguished from one that simply never received Unlock.
+
+The SetIndices implementation hook is now mandatory whenever D3D9Ex
+compatibility is requested. Continuing without that hook would pass a façade
+pointer to the native D3D9 runtime instead of the real index buffer. Diagnostic
+render-target references are also released before bridge resources are torn
+down, preventing probes from keeping obsolete default-pool surfaces alive over
+reset.
+
+This hardening has only received offline build and compatibility-test coverage.
+No FEAR or OpenXR run has been performed, so it does not change the fault
+boundary or conclusions below. The next Retail run should use the correlated
+lifecycle events to answer the existing checkpoint rather than add another
+reset workaround.
+
 ## Experiment ledger
 
 | Experiment | Result | Conclusion |
