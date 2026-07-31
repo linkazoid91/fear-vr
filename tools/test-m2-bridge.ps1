@@ -22,6 +22,30 @@
 .PARAMETER Stereo
     Rendert synthetisch ein rotes linkes und ein blaues rechtes Auge und
     prüft zusätzlich den M3-Stereo-Transportvertrag.
+
+.PARAMETER D3D9ExCompat
+    Ruft die klassische Direct3DCreate9-Oberfläche auf, erwartet aber ein
+    durch Direct3DCreate9Ex gestütztes Gerät und den direkten Shared-Pfad.
+
+.PARAMETER Fullscreen
+    Verwendet Retail-konformes exklusives Vollbild mit einer klassischen
+    Null-Hertz-Anforderung, die der D3D9Ex-Fassade übersetzt.
+
+.PARAMETER Multisample4
+    Erstellt wie Retail einen vierfach multisampleten Backbuffer.
+
+.PARAMETER SwapChainPresent
+    Präsentiert über IDirect3DSwapChain9::Present wie die Retail-Engine.
+
+.PARAMETER ImplementationPresent
+    Präsentiert über den klassischen, implementation-level Device-Pfad.
+
+.PARAMETER MagentaSurfaceTest
+    Füllt die exakt an Present übergebene Oberfläche für ein Bild magenta.
+
+.PARAMETER OffscreenFinal
+    Präsentiert einen schwarzen Backbuffer, während Render-Target 0 Farbe
+    enthält, und prüft den Final-Composite-Fallback.
 #>
 [CmdletBinding()]
 param(
@@ -32,7 +56,21 @@ param(
 
     [switch]$ClassicD3D9,
 
-    [switch]$Stereo
+    [switch]$Stereo,
+
+    [switch]$D3D9ExCompat,
+
+    [switch]$Fullscreen,
+
+    [switch]$Multisample4,
+
+    [switch]$SwapChainPresent,
+
+    [switch]$ImplementationPresent,
+
+    [switch]$MagentaSurfaceTest,
+
+    [switch]$OffscreenFinal
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,6 +140,16 @@ Write-Host "Producer: $producerExe"
 Write-Host "Proxy:    $proxyDll"
 $testMode = if ($AbortHost) {
     'Host-Abbruch / Fail-open'
+} elseif ($D3D9ExCompat -and $SwapChainPresent) {
+    'Classic API / D3D9Ex compatibility / swap-chain Present / direct'
+} elseif ($D3D9ExCompat -and $ImplementationPresent) {
+    'Classic API / D3D9Ex compatibility / implementation Present / direct'
+} elseif ($D3D9ExCompat -and $Fullscreen -and $Multisample4) {
+    'Classic API / D3D9Ex compatibility / fullscreen / 4x MSAA / direct'
+} elseif ($D3D9ExCompat -and $Fullscreen) {
+    'Classic API / D3D9Ex compatibility / fullscreen / direct'
+} elseif ($Stereo -and $D3D9ExCompat) {
+    'M3 Stereo / Classic API / D3D9Ex compatibility / direct'
 } elseif ($Stereo -and $ClassicD3D9) {
     'M3 Stereo / Classic D3D9 / CPU-D3D9Ex + Reset'
 } elseif ($Stereo) {
@@ -173,9 +221,36 @@ try {
     if ($ClassicD3D9) {
         $producerArguments += '--classic-d3d9'
     }
+    if ($D3D9ExCompat) {
+        $producerArguments += '--classic-d3d9'
+        $producerArguments += '-fearvr-d3d9ex-compat'
+        $producerArguments += '--expect-ex-device'
+        $producerArguments += '--probe-managed-resources'
+        $producerArguments += '--scene-boundary'
+        if ($SwapChainPresent) {
+            $producerArguments += '--swapchain-present'
+        } elseif (-not $ImplementationPresent) {
+            $producerArguments += '--present-ex'
+        }
+    }
+    if ($ClassicD3D9 -and -not $D3D9ExCompat) {
+        $producerArguments += '--scene-boundary'
+    }
+    if ($Fullscreen) {
+        $producerArguments += '--fullscreen-default-refresh'
+    }
+    if ($Multisample4) {
+        $producerArguments += '--multisample4'
+    }
     if ($Stereo) {
         $producerArguments += '-fearvr-stereo'
         $producerArguments += '--stereo'
+    }
+    if ($MagentaSurfaceTest) {
+        $producerArguments += '-fearvr-magenta-surface-test'
+    }
+    if ($OffscreenFinal) {
+        $producerArguments += '--offscreen-final'
     }
     $producerProcess = Start-M2Process `
         -FilePath $producerExe `
@@ -230,19 +305,49 @@ try {
         'host_connected',
         'adapter_match',
         'shared_resources',
-        'frame_ready',
-        'device_reset_begin',
-        'device_reset_complete'
+        'frame_ready'
     )
+    if (-not $Fullscreen) {
+        $requiredProxyEvents += 'device_reset_begin'
+        $requiredProxyEvents += 'device_reset_complete'
+    }
+    if ($D3D9ExCompat -and -not $Fullscreen) {
+        $requiredProxyEvents += 'd3d9ex_reset_redirected'
+    }
+    if ($D3D9ExCompat -or $ClassicD3D9) {
+        if ($D3D9ExCompat) {
+            $requiredProxyEvents += 'd3d9ex_managed_index_create_details'
+            $requiredProxyEvents += 'd3d9ex_managed_index_lock'
+            $requiredProxyEvents += 'd3d9ex_managed_index_set'
+        }
+        $requiredProxyEvents += 'app_local_present_detour'
+        $requiredProxyEvents += 'd3d9_end_scene_activity'
+        $requiredProxyEvents += 'd3d9_present_source'
+        $requiredProxyEvents += 'd3d9_pixel_probe'
+    }
+    if ($SwapChainPresent) {
+        $requiredProxyEvents += 'swapchain_present_hooked'
+    }
     if ($Stereo) {
         $requiredProxyEvents += 'stereo_frame_staged'
+    }
+    if ($MagentaSurfaceTest) {
+        $requiredProxyEvents += 'magenta_surface_test'
+    }
+    if ($OffscreenFinal) {
+        $requiredProxyEvents += 'capture_source_fallback'
     }
     foreach ($event in $requiredProxyEvents) {
         if ($proxyText -notmatch ('"event":"' + [regex]::Escape($event) + '"')) {
             throw "Proxy-Gate fehlt im Log: $event"
         }
     }
-    foreach ($event in @('ipc_connected', 'adapter_match', 'ipc_frame')) {
+    foreach ($event in @(
+        'ipc_connected',
+        'adapter_match',
+        'ipc_frame',
+        'pixel_probe'
+    )) {
         if ($hostText -notmatch ('"event":"' + [regex]::Escape($event) + '"')) {
             throw "Host-Gate fehlt im Log: $event"
         }
@@ -255,9 +360,87 @@ try {
             'Stereo-Transport selbst ist bestätigt.'
         )
     }
+    if ($hostText -notmatch '"event":"pixel_probe".+nonzero_samples=[1-9][0-9]*') {
+        throw (
+            "$milestoneLabel-Gate: Shared frames contained only black pixels."
+        )
+    }
+    if ($Stereo) {
+        $leftStereoProbe = $false
+        $rightStereoProbe = $false
+        foreach ($line in ($hostText -split "\r?\n")) {
+            if ($line -notmatch '"event":"pixel_probe"') {
+                continue
+            }
+            try {
+                $entry = $line | ConvertFrom-Json
+            } catch {
+                continue
+            }
+            $match = [regex]::Match(
+                [string]$entry.message,
+                'eye=(\d+).+avg_bgr=(\d+),(\d+),(\d+)'
+            )
+            if (-not $match.Success) {
+                continue
+            }
+            $eye = [int]$match.Groups[1].Value
+            $blue = [int]$match.Groups[2].Value
+            $red = [int]$match.Groups[4].Value
+            if ($eye -eq 0 -and $red -gt ($blue + 64)) {
+                $leftStereoProbe = $true
+            }
+            if ($eye -eq 1 -and $blue -gt ($red + 64)) {
+                $rightStereoProbe = $true
+            }
+        }
+        if (-not $leftStereoProbe -or -not $rightStereoProbe) {
+            throw (
+                'M3-Gate: expected distinct red-left and blue-right ' +
+                'shared surfaces were not observed.'
+            )
+        }
+    }
+    if ($MagentaSurfaceTest -and
+        $proxyText -notmatch (
+            '"event":"d3d9_pixel_probe".+' +
+            'surface=presented_magenta.+' +
+            'nonzero_samples=[1-9][0-9]*.+' +
+            'avg_bgr=255,0,255'
+        )) {
+        throw (
+            'Magenta-Gate: the exact presented surface did not read back ' +
+            'as magenta.'
+        )
+    }
     if ($AbortHost -and
         $proxyText -notmatch '"event":"host_disconnected"') {
         throw 'Fail-open-Gate fehlt: Proxy erkannte den Host-Abbruch nicht.'
+    }
+    if ($D3D9ExCompat -and
+        $proxyText -notmatch 'path=direct') {
+        throw 'D3D9Ex-Kompatibilitäts-Gate fehlt: path=direct.'
+    }
+    if ($D3D9ExCompat -and
+        $proxyText -match 'path=cpu_d3d9ex') {
+        throw 'D3D9Ex-Kompatibilitäts-Gate: CPU-Fallback wurde aktiviert.'
+    }
+    $expectedPresentPath = if ($SwapChainPresent) {
+        'swapchain_present'
+    } elseif ($D3D9ExCompat -and -not $ImplementationPresent) {
+        'device_present_ex'
+    } else {
+        'app_local_device_present'
+    }
+    if (($D3D9ExCompat -or $ClassicD3D9) -and
+        $proxyText -notmatch (
+            '"event":"d3d9_present_source".+path=' +
+            [regex]::Escape($expectedPresentPath)
+        )) {
+        throw (
+            'Present-Pfad-Gate fehlt: erwartete exakte Quelle für path=' +
+            $expectedPresentPath
+        )
     }
 
     $passed = if ($Stereo) {

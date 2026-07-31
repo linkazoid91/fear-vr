@@ -84,10 +84,13 @@ two expected exports:
 - `SetMasterDatabase` delegates to the stock module, then installs VR hooks
   using the engine's initialized interface database.
 
-The same loader lazily loads `fearvr-d3d9.dll` and asks it to install the D3D9
-IAT and late-device hooks. `DllMain` in both DLLs only disables thread
-notifications; OpenXR, D3D, IPC, logging, and hook initialization happen later,
-outside the loader lock.
+On a release install, Windows has already loaded the app-local `d3d9.dll`
+proxy before `GameClient.dll`. The loader identifies it through FearVR-specific
+exports and reuses that module, keeping one bridge state for D3D and stereo
+hooks. The uniquely named staged `fearvr-d3d9.dll` remains the legacy fallback
+when no app-local proxy is loaded. `DllMain` only disables thread notifications;
+OpenXR, D3D, IPC, logging, and hook initialization happen later, outside the
+loader lock.
 
 This arrangement preserves the original client behavior while putting the
 smallest practical compatibility boundary in front of it.
@@ -112,9 +115,13 @@ The installer creates an isolated tree containing:
   logs/                one directory per run
 ```
 
+It also installs `<retail>/d3d9.dll`, recording its exact path, byte count, and
+SHA-256 in `deployment.json`.
+
 The five proprietary Public Tools files are copied from the user's own
-installation. They are deliberately absent from release packages. The retail
-game directory is read but never modified.
+installation. They are deliberately absent from release packages. No original
+Retail executable, DLL, archive, or data file is modified. An existing
+different app-local `d3d9.dll` is treated as a conflict and never overwritten.
 
 Startup proceeds as follows:
 
@@ -129,13 +136,15 @@ Startup proceeds as follows:
    required graphics adapter, creates D3D11, then creates the session, local
    reference space, and one swapchain per eye.
 6. The launcher starts F.E.A.R. with the same session ID, the isolated
-   `-archcfg`, the isolated `-userdirectory`, and feature switches.
-7. LithTech loads the staged GameClient loader. The loader delegates to
-   `GameOrig.dll`, loads the bridge, and installs only the hooks whose
-   signatures and interfaces validate.
-8. The bridge creates the session-named shared mapping and events on its first
+   `-archcfg`, the isolated `-userdirectory`, and feature switches. It adds
+   `-fearvr-d3d9ex-compat` only after the app-local proxy hash validates.
+7. Windows resolves F.E.A.R.'s D3D9 import to the app-local proxy. Its classic
+   `Direct3DCreate9` facade creates an internal `IDirect3D9Ex` device.
+8. LithTech loads the staged GameClient loader. It delegates to `GameOrig.dll`,
+   reuses the loaded proxy bridge, and installs only validated hooks.
+9. The bridge creates the session-named shared mapping and events on its first
    relevant game call. The already-running host polls for and opens them.
-9. Heartbeats and adapter LUIDs are exchanged. Image transfer is enabled only
+10. Heartbeats and adapter LUIDs are exchanged. Image transfer is enabled only
    after the protocol and adapter match.
 
 For Steam installations, Steam remains the store/activation launcher. SteamVR
@@ -260,21 +269,22 @@ to avoid accidentally replacing most of the stereo world with mono content.
 There are three shared texture slots per eye. Left and right slots with the same
 index always form a pair and carry the same frame ID and generation.
 
-For a D3D9Ex game device, the bridge can copy directly into D3D9 shared
-render-target textures. Retail F.E.A.R. normally creates a classic D3D9 device,
-so the current compatibility path:
+The app-local proxy keeps the API surface Retail expects: `Direct3DCreate9`
+returns an `IDirect3D9` compatibility object. Its `CreateDevice` translates to
+`IDirect3D9Ex::CreateDeviceEx`, so the resulting device can allocate shareable
+render-target textures. Eye capture then stays on the GPU:
 
-1. reads each completed eye surface into system memory with
-   `GetRenderTargetData`;
-2. copies rows into a system-memory surface owned by a helper D3D9Ex device;
-3. uploads that surface into a shared D3D9Ex texture; and
-4. exposes its shared handle to D3D11.
+1. the bridge copies each completed eye into its D3D9Ex shared texture;
+2. it publishes that texture's shared handle and signals the slot;
+3. the x64 D3D11 host opens the same allocation and composites it into the
+   OpenXR swapchain.
 
-The bridge marks this path with `FEARVR_BF_CPU_FALLBACK`. The GPU HUD compositor
-removes HUD pixel processing from the CPU, but it cannot remove the classic
-D3D9 readback. Eliminating that remaining per-eye readback requires making the
-game device effectively D3D9Ex-compatible, including emulation of resources
-that Retail creates in `D3DPOOL_MANAGED`.
+This is logged as `path=direct` and does not set `FEARVR_BF_CPU_FALLBACK`.
+Because D3D9Ex has no `D3DPOOL_MANAGED`, the bridge intercepts Retail texture,
+volume texture, cube texture, vertex-buffer, and index-buffer creation and
+translates managed allocations to lockable dynamic default-pool resources.
+The classic CPU-copy transport remains fail-open when the compatibility flag
+is absent.
 
 ## 7. IPC and synchronization
 
@@ -459,8 +469,10 @@ verified Retail state and applies those tested decisions.
 
 ## 14. Known architectural debt
 
-1. Retail's classic D3D9 device still requires two per-frame CPU readbacks for
-   stereo transport. This is the largest structural performance limitation.
+1. Managed-resource compatibility is currently a lightweight pool/usage
+   translation. A Retail path that requires behavior not covered by the probes,
+   or inspects `GetDesc().Pool`, may need a full SYSTEMMEM shadow plus
+   DEFAULT-pool mirror wrapper.
 2. HUD separation is image-difference based. A native HUD render target or
    OpenXR UI layer would avoid right-eye contamination at transparent edges.
 3. Most GameClient integrations are tied to verified Retail 1.08 byte patterns,

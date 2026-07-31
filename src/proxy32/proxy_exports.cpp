@@ -1,4 +1,5 @@
 #include "bridge.h"
+#include "d3d9ex_compat.h"
 #include "iat_hook.h"
 #include "system_d3d9.h"
 
@@ -14,6 +15,19 @@ Function Required(const char* name) noexcept {
 } // namespace
 
 extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
+    if (fearvr::D3D9ExCompatibilityRequested()) {
+        IDirect3D9* compatibility =
+            fearvr::CreateD3D9ExCompatibility(sdkVersion);
+        if (compatibility != nullptr) {
+            fearvr::ReportHookStatus(
+                "INFO", "d3d9ex_compat_factory",
+                "Direct3DCreate9 is backed by Direct3DCreate9Ex.");
+            return compatibility;
+        }
+        fearvr::ReportHookStatus(
+            "WARN", "d3d9ex_compat_factory_failed",
+            "Direct3DCreate9Ex compatibility failed; classic D3D9 resumed.");
+    }
     using Function = IDirect3D9*(WINAPI*)(UINT);
     const Function real = Required<Function>("Direct3DCreate9");
     if (real == nullptr) {
@@ -218,6 +232,10 @@ extern "C" BOOL FearVr_InstallIatHook() {
             reinterpret_cast<void*>(&Direct3DCreate9));
     const BOOL lateHooksInstalled = fearvr::InstallLateD3D9Hooks();
     return iatInstalled || lateHooksInstalled;
+}
+
+extern "C" BOOL FearVr_AreLateHooksActive() {
+    return fearvr::AreLateD3D9HooksActive();
 }
 
 #if !defined(_M_IX86)

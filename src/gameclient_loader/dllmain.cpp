@@ -17,6 +17,13 @@ INIT_ONCE g_bridgeOnce = INIT_ONCE_STATIC_INIT;
 HMODULE g_original = nullptr;
 HMODULE g_bridge = nullptr;
 
+bool IsFearVrBridge(HMODULE module) noexcept {
+    return module != nullptr &&
+        GetProcAddress(module, "FearVr_InstallIatHook") != nullptr &&
+        GetProcAddress(module, "FearVr_BeginEye") != nullptr &&
+        GetProcAddress(module, "FearVr_ReportHookStatus") != nullptr;
+}
+
 bool ModuleSiblingPath(const wchar_t* fileName,
                        wchar_t (&path)[MAX_PATH]) noexcept {
     HMODULE self = nullptr;
@@ -43,18 +50,47 @@ BOOL CALLBACK LoadBridge(PINIT_ONCE once, PVOID parameter,
     (void)once;
     (void)parameter;
     (void)context;
-    wchar_t path[MAX_PATH]{};
-    if (!ModuleSiblingPath(L"fearvr-d3d9.dll", path)) {
-        return TRUE;
+
+    // In the zero-copy Retail configuration, the app-local d3d9.dll proxy is
+    // loaded by FEAR.exe before GameClient.dll. Reuse that module so the D3D
+    // hooks and stereo callbacks share one bridge state.
+    bool reusedAppLocalProxy = false;
+    HMODULE appLocalProxy = GetModuleHandleW(L"d3d9.dll");
+    if (IsFearVrBridge(appLocalProxy)) {
+        g_bridge = appLocalProxy;
+        reusedAppLocalProxy = true;
     }
-    g_bridge = LoadLibraryExW(
-        path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (g_bridge != nullptr) {
+
+    wchar_t path[MAX_PATH]{};
+    if (g_bridge == nullptr) {
+        if (!ModuleSiblingPath(L"fearvr-d3d9.dll", path)) {
+            return TRUE;
+        }
+        g_bridge = LoadLibraryExW(
+            path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
+
+    if (g_bridge != nullptr && !reusedAppLocalProxy) {
         using InstallFunction = BOOL(__cdecl*)();
         const auto install = reinterpret_cast<InstallFunction>(
             GetProcAddress(g_bridge, "FearVr_InstallIatHook"));
         if (install != nullptr) {
             install();
+        }
+    } else if (reusedAppLocalProxy) {
+        // The app-local proxy already owns Direct3DCreate9 before Retail can
+        // create a device. Installing the legacy late hooks here patches a
+        // classic system-device vtable and prevents the actual D3D9Ex device
+        // from receiving its managed-resource and Reset/Present hooks.
+        using ReportFunction =
+            void(__cdecl*)(const char*, const char*, const char*);
+        const auto report = reinterpret_cast<ReportFunction>(
+            GetProcAddress(g_bridge, "FearVr_ReportHookStatus"));
+        if (report != nullptr) {
+            report(
+                "INFO", "app_local_proxy_reused",
+                "App-local d3d9.dll already owns device creation; "
+                "legacy IAT and late hooks were skipped.");
         }
     }
     return TRUE;

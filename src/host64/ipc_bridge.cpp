@@ -446,6 +446,18 @@ bool IpcBridge::FinishPendingCopy() {
     if (FAILED(result)) {
         LogHresult("d3d11_query_failed", result);
     }
+    constexpr std::uint32_t allEyesMask =
+        (1U << FEARVR_EYE_COUNT) - 1U;
+    if (pixelProbeNonBlackMask_ != allEyesMask &&
+        pixelProbeAttempts_ < 64 &&
+        (pixelProbeAttempts_ == 0 ||
+         pending_->frameId >=
+             static_cast<std::uint64_t>(pixelProbeAttempts_) * 30U)) {
+        ++pixelProbeAttempts_;
+        for (std::uint32_t eye = 0; eye < FEARVR_EYE_COUNT; ++eye) {
+            ProbePrivatePixels(eye);
+        }
+    }
     ReleaseClaim(pending_->slotIndex);
     for (auto& source : pending_->source) {
         source.Reset();
@@ -453,6 +465,82 @@ bool IpcBridge::FinishPendingCopy() {
     pending_->active = false;
     SetEvent(slotConsumedEvent_);
     return true;
+}
+
+bool IpcBridge::ProbePrivatePixels(std::uint32_t eye) {
+    if (eye >= FEARVR_EYE_COUNT || !privateEye_[eye].texture) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC description{};
+    privateEye_[eye].texture->GetDesc(&description);
+    D3D11_TEXTURE2D_DESC stagingDescription = description;
+    stagingDescription.Usage = D3D11_USAGE_STAGING;
+    stagingDescription.BindFlags = 0;
+    stagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDescription.MiscFlags = 0;
+
+    ComPtr<ID3D11Texture2D> staging;
+    HRESULT result = device_->CreateTexture2D(
+        &stagingDescription, nullptr,
+        staging.ReleaseAndGetAddressOf());
+    if (FAILED(result)) {
+        LogHresult("pixel_probe_texture_failed", result);
+        return false;
+    }
+    context_->CopyResource(staging.Get(), privateEye_[eye].texture.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    result = context_->Map(
+        staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(result)) {
+        LogHresult("pixel_probe_map_failed", result);
+        return false;
+    }
+
+    const UINT stepX = (std::max)(1U, description.Width / 64U);
+    const UINT stepY = (std::max)(1U, description.Height / 64U);
+    std::uint64_t samples = 0;
+    std::uint64_t nonBlackSamples = 0;
+    std::uint64_t blue = 0;
+    std::uint64_t green = 0;
+    std::uint64_t red = 0;
+    for (UINT y = 0; y < description.Height; y += stepY) {
+        const auto* row =
+            static_cast<const std::uint8_t*>(mapped.pData) +
+            static_cast<std::size_t>(y) * mapped.RowPitch;
+        for (UINT x = 0; x < description.Width; x += stepX) {
+            const auto* pixel = row + static_cast<std::size_t>(x) * 4U;
+            blue += pixel[0];
+            green += pixel[1];
+            red += pixel[2];
+            nonBlackSamples +=
+                (pixel[0] | pixel[1] | pixel[2]) != 0 ? 1U : 0U;
+            ++samples;
+        }
+    }
+    context_->Unmap(staging.Get(), 0);
+
+    if (nonBlackSamples != 0) {
+        pixelProbeNonBlackMask_ |= 1U << eye;
+    }
+    std::ostringstream message;
+    message << "eye=" << eye
+            << " frame=" << pending_->frameId
+            << " attempt=" << pixelProbeAttempts_
+            << " samples=" << samples
+            << " nonzero_samples=" << nonBlackSamples
+            << " avg_bgr=";
+    if (samples == 0) {
+        message << "0,0,0";
+    } else {
+        message << blue / samples << ','
+                << green / samples << ','
+                << red / samples;
+    }
+    log_(nonBlackSamples == 0 ? "WARN" : "INFO",
+         "pixel_probe", message.str());
+    return nonBlackSamples != 0;
 }
 
 bool IpcBridge::FindAndClaimPair(std::uint32_t& slotIndex,

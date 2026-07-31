@@ -3,9 +3,10 @@
     Removes the F.E.A.R. VR installation.
 
 .DESCRIPTION
-    Deletes the install folder and the desktop shortcut. The retail
-    installation was never written to and stays untouched; a Steam file
-    verification is not needed.
+    Deletes the install folder, desktop shortcut, and the app-local d3d9.dll
+    proxy recorded by the installer. The proxy is removed only when its
+    current SHA-256 still matches the deployment record. FEAR.exe and retail
+    game data are never modified.
 
     Saved games and profiles live in <InstallDir>\userdata and are kept
     unless -IncludeUserData is given.
@@ -53,10 +54,12 @@ if (-not (Test-Path -LiteralPath $InstallDir -PathType Container)) {
 }
 
 $deploymentPath = Join-Path $InstallDir 'deployment.json'
+$deployment = $null
 $retailRoot = $null
 if (Test-Path -LiteralPath $deploymentPath -PathType Leaf) {
-    $retailRoot = (Get-Content -Raw -LiteralPath $deploymentPath |
-        ConvertFrom-Json).retailRoot
+    $deployment = Get-Content -Raw -LiteralPath $deploymentPath |
+        ConvertFrom-Json
+    $retailRoot = $deployment.retailRoot
 }
 $retailBefore = $null
 if ($retailRoot -and (Test-Path -LiteralPath $retailRoot -PathType Container)) {
@@ -67,6 +70,42 @@ function Get-SizeMb([string]$Path) {
     $bytes = (Get-ChildItem -LiteralPath $Path -Recurse -File `
         -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
     return [math]::Round(($bytes / 1MB), 1)
+}
+
+# The deployment record is deliberately consumed before deployment.json is
+# removed. A changed or foreign d3d9.dll is always preserved.
+if ($deployment -and
+    $deployment.PSObject.Properties.Name -contains 'd3d9Proxy') {
+    $proxyRemoval = Remove-FearVrAppLocalProxy `
+        -RetailRoot ([string]$retailRoot) `
+        -Record $deployment.d3d9Proxy
+    switch ($proxyRemoval.Status) {
+        'WouldRemove' {
+            Write-Host "  * remove app-local proxy $($proxyRemoval.Path)"
+            if ($Apply) {
+                $removed = Remove-FearVrAppLocalProxy `
+                    -RetailRoot ([string]$retailRoot) `
+                    -Record $deployment.d3d9Proxy `
+                    -Apply
+                if ($removed.Status -ne 'Removed') {
+                    throw 'The app-local proxy changed during uninstall.'
+                }
+            }
+        }
+        'Modified' {
+            Write-Host (
+                '  * keeping modified/foreign app-local d3d9.dll: ' +
+                $proxyRemoval.Path) -ForegroundColor Yellow
+        }
+        'InvalidRecord' {
+            Write-Host (
+                '  * keeping app-local d3d9.dll because proxy metadata is ' +
+                'invalid') -ForegroundColor Yellow
+        }
+        'Missing' {
+            Write-Host '  * app-local F.E.A.R. VR proxy is already absent'
+        }
+    }
 }
 
 # userdata is the game's -userdirectory: saved games, profiles, screenshots.
@@ -116,7 +155,7 @@ if ($retailBefore) {
         throw 'SAFETY ABORT: the retail FEAR.exe was modified.'
     }
     Write-Host ''
-    Write-Host 'Retail unchanged; a Steam file verification is not needed.'
+    Write-Host 'FEAR.exe and retail game data are unchanged.'
 }
 
 Write-Host ''

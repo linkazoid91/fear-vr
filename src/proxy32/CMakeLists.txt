@@ -21,6 +21,8 @@ add_subdirectory(
 add_library(fearvr-proxy SHARED
   bridge.cpp
   bridge.h
+  d3d9ex_compat.cpp
+  d3d9ex_compat.h
   d3d9.def
   dllmain.cpp
   iat_hook.cpp

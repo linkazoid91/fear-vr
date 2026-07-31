@@ -23,28 +23,32 @@ if (-not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) {
 }
 
 $text = [IO.File]::ReadAllText($SettingsPath)
+$sectionPattern =
+    '(?ms)(^\s*"steamvr"\s*:\s*\{\s*\r?\n)(.*?)(^\s*\})'
+$sectionMatch = [Text.RegularExpressions.Regex]::Match(
+    $text,
+    $sectionPattern
+)
+if (-not $sectionMatch.Success) {
+    throw 'Abschnitt "steamvr" fehlt in steamvr.vrsettings.'
+}
+
+$sectionText = $sectionMatch.Value
 $valuePattern =
     '(?m)("autoShowGameTheater"\s*:\s*)(true|false)'
 $changed = $false
 
-if ([Text.RegularExpressions.Regex]::IsMatch($text, $valuePattern)) {
-    $updated = [Text.RegularExpressions.Regex]::Replace(
-        $text,
+if ([Text.RegularExpressions.Regex]::IsMatch($sectionText, $valuePattern)) {
+    $updatedSection = [Text.RegularExpressions.Regex]::Replace(
+        $sectionText,
         $valuePattern,
         '${1}false'
     )
-    $changed = $updated -cne $text
+    $changed = $updatedSection -cne $sectionText
 } else {
-    $sectionPattern = '(?m)(^\s*"steamvr"\s*:\s*\{\s*\r?\n)'
-    if (-not [Text.RegularExpressions.Regex]::IsMatch(
-        $text,
-        $sectionPattern
-    )) {
-        throw 'Abschnitt "steamvr" fehlt in steamvr.vrsettings.'
-    }
-    $updated = [Text.RegularExpressions.Regex]::Replace(
-        $text,
-        $sectionPattern,
+    $updatedSection = [Text.RegularExpressions.Regex]::Replace(
+        $sectionText,
+        '(?m)(^\s*"steamvr"\s*:\s*\{\s*\r?\n)',
         '${1}      "autoShowGameTheater" : false,' + [Environment]::NewLine,
         1
     )
@@ -52,6 +56,11 @@ if ([Text.RegularExpressions.Regex]::IsMatch($text, $valuePattern)) {
 }
 
 if ($changed) {
+    $updated =
+        $text.Substring(0, $sectionMatch.Index) +
+        $updatedSection +
+        $text.Substring($sectionMatch.Index + $sectionMatch.Length)
+
     # Der Sicherungsort kommt aus dem eigenen Skriptort, nicht aus einer
     # Projektkonfiguration.
     #

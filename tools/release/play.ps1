@@ -4,8 +4,9 @@
 
 .DESCRIPTION
     Startet den x64-OpenXR-Host, wartet auf XR-ready und ruft danach Steam mit
-    der offiziellen App-ID auf. Geladen wird ausschliesslich ueber die lose
-    archcfg-Schicht; die Retail-Installation bleibt unveraendert.
+    der offiziellen App-ID auf. Spielmodule kommen aus der losen
+    archcfg-Schicht; der hash-gepruefte app-lokale d3d9.dll-Proxy uebertraegt
+    das D3D9-Bild ueber den D3D9Ex-Zero-Copy-Pfad.
 
 .PARAMETER Runtime
     active (Standard), steamvr, vdxr oder ein Pfad zu einem
@@ -23,6 +24,24 @@ param(
     [switch]$NoStereoHud,
 
     [switch]$NoHeadBob,
+
+    # Diagnose: laesst den GPU-HUD-Compositor vollstaendig aus.
+    [switch]$NoGpuHud,
+
+    # Diagnose: fuellt die praesentierte Quellflaeche einmal magenta.
+    [switch]$MagentaSurfaceTest,
+
+    # Rueckwaertskompatibler Schalter; D3D9Ex ist jetzt Standard.
+    [switch]$D3D9Ex,
+
+    # Diagnose/Fallback: klassisches D3D9 mit CPU-Transfer.
+    [switch]$NoD3D9Ex,
+
+    # VDXR-Diagnose: behaelt den exklusiven Vollbildmodus von Retail bei.
+    [switch]$D3D9ExExclusive,
+
+    # Startet nur FEAR in einem kleinen D3D9Ex-Desktopfenster, ohne OpenXR.
+    [switch]$DesktopD3D9ExTest,
 
     # Diagnose: schaltet Gruppen unserer Schreibzugriffe auf Retail-Objekte ab,
     # um den Absturz an einer bestimmten Stelle einzugrenzen.
@@ -103,6 +122,56 @@ foreach ($record in $deployment.files) {
     }
 }
 
+$useD3D9ExCompatibility = $false
+$d3d9ExAvailable = $false
+if ($deployment.PSObject.Properties.Name -contains 'd3d9ExCompatibility' -and
+    [bool]$deployment.d3d9ExCompatibility) {
+    if (-not ($deployment.PSObject.Properties.Name -contains 'd3d9Proxy')) {
+        throw 'Proxy metadata is missing. Please reinstall F.E.A.R. VR.'
+    }
+    $proxyState = Get-FearVrAppLocalProxyState `
+        -RetailRoot ([string]$deployment.retailRoot) `
+        -Record $deployment.d3d9Proxy
+    switch ($proxyState.Status) {
+        'Owned' {
+            $d3d9ExAvailable = $true
+        }
+        'Missing' {
+            Write-Host @"
+  [!]  The F.E.A.R. VR app-local d3d9.dll is missing.
+       Starting the compatible legacy CPU-copy path. Reinstall to restore
+       the required D3D9Ex zero-copy path.
+"@ -ForegroundColor Yellow
+        }
+        'Modified' {
+            throw ("The app-local d3d9.dll was replaced or modified: " +
+                   "$($proxyState.Path). Refusing to load an untracked wrapper.")
+        }
+        default {
+            throw 'Proxy metadata is invalid. Please reinstall F.E.A.R. VR.'
+        }
+    }
+}
+
+if ($D3D9Ex -and $NoD3D9Ex) {
+    throw '-D3D9Ex and -NoD3D9Ex cannot be used together.'
+}
+if ($D3D9ExExclusive -and $NoD3D9Ex) {
+    throw '-D3D9ExExclusive requires D3D9Ex.'
+}
+if ($DesktopD3D9ExTest -and $NoD3D9Ex) {
+    throw '-DesktopD3D9ExTest requires D3D9Ex.'
+}
+if ($DesktopD3D9ExTest -and $D3D9ExExclusive) {
+    throw '-DesktopD3D9ExTest and -D3D9ExExclusive are mutually exclusive.'
+}
+if ($D3D9Ex -and -not $d3d9ExAvailable) {
+    throw 'D3D9Ex compatibility is unavailable for this installation.'
+}
+if (-not $NoD3D9Ex -and $d3d9ExAvailable) {
+    $useD3D9ExCompatibility = $true
+}
+
 $hostExe = Join-Path $packageRoot 'bin\x64\fearvr-host.exe'
 if (-not (Test-Path -LiteralPath $hostExe -PathType Leaf)) {
     throw "Hostprogramm fehlt: $hostExe"
@@ -134,7 +203,16 @@ if ($running.Count -gt 0) {
 }
 
 # --- Runtime ----------------------------------------------------------------
-$runtimeInfo = Resolve-OpenXrRuntime $Runtime
+$runtimeInfo = if ($DesktopD3D9ExTest) {
+    [pscustomobject]@{
+        Path = $null
+        Name = 'Desktop-only D3D9Ex diagnostic'
+        Kind = 'desktop'
+        Override = $false
+    }
+} else {
+    Resolve-OpenXrRuntime $Runtime
+}
 $usesSteamVr = $runtimeInfo.Kind -eq 'steamvr'
 
 $sessionId = [uint64]([DateTime]::UtcNow.Ticks) -bxor ([uint64]$PID -shl 32)
@@ -157,19 +235,22 @@ if ($usesSteamVr -and (Test-Path -LiteralPath $theaterScript -PathType Leaf)) {
 }
 
 # --- Host starten -----------------------------------------------------------
-$hostArguments = @(
-    '--ipc-session', $sessionText,
-    '--exit-on-game-disconnect',
-    '--log-dir', "`"$runLogDirectory`""
-)
-$previousRuntimeJson = $env:XR_RUNTIME_JSON
-try {
-    if ($runtimeInfo.Override) { $env:XR_RUNTIME_JSON = $runtimeInfo.Path }
-    $hostProcess = Start-Process -FilePath $hostExe `
-        -ArgumentList $hostArguments `
-        -WorkingDirectory (Split-Path -Parent $hostExe) -PassThru
-} finally {
-    $env:XR_RUNTIME_JSON = $previousRuntimeJson
+$hostProcess = $null
+if (-not $DesktopD3D9ExTest) {
+    $hostArguments = @(
+        '--ipc-session', $sessionText,
+        '--exit-on-game-disconnect',
+        '--log-dir', "`"$runLogDirectory`""
+    )
+    $previousRuntimeJson = $env:XR_RUNTIME_JSON
+    try {
+        if ($runtimeInfo.Override) { $env:XR_RUNTIME_JSON = $runtimeInfo.Path }
+        $hostProcess = Start-Process -FilePath $hostExe `
+            -ArgumentList $hostArguments `
+            -WorkingDirectory (Split-Path -Parent $hostExe) -PassThru
+    } finally {
+        $env:XR_RUNTIME_JSON = $previousRuntimeJson
+    }
 }
 
 # Uebersetzt die Fehlermeldung des Hosts in einen brauchbaren Hinweis.
@@ -202,27 +283,29 @@ Virtual Desktop Streamer bzw. SteamVR starten, oder mit
     return $detail
 }
 
-$hostLog = $null
-$ready = $false
-$deadline = (Get-Date).AddSeconds(30)
-do {
-    Start-Sleep -Milliseconds 200
-    $hostProcess.Refresh()
-    if ($hostProcess.HasExited) {
-        $hint = Get-HostFailureHint $runLogDirectory
-        if ($hint) { throw $hint }
-        throw ("OpenXR-Host endete vor XR-ready " +
-               "(Exitcode $($hostProcess.ExitCode)). Headset und Runtime pruefen.")
+if (-not $DesktopD3D9ExTest) {
+    $hostLog = $null
+    $ready = $false
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        Start-Sleep -Milliseconds 200
+        $hostProcess.Refresh()
+        if ($hostProcess.HasExited) {
+            $hint = Get-HostFailureHint $runLogDirectory
+            if ($hint) { throw $hint }
+            throw ("OpenXR-Host endete vor XR-ready " +
+                   "(Exitcode $($hostProcess.ExitCode)). Headset und Runtime pruefen.")
+        }
+        $hostLog = Get-ChildItem -LiteralPath $runLogDirectory -Filter 'host-*.log' `
+            -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+        $ready = $null -ne $hostLog -and
+            (Get-Content -Raw -LiteralPath $hostLog.FullName) -match '"event":"xr_ready"'
+    } until ($ready -or (Get-Date) -ge $deadline)
+    if (-not $ready) {
+        Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue
+        throw 'OpenXR-Host wurde nicht innerhalb von 30 Sekunden bereit.'
     }
-    $hostLog = Get-ChildItem -LiteralPath $runLogDirectory -Filter 'host-*.log' `
-        -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-    $ready = $null -ne $hostLog -and
-        (Get-Content -Raw -LiteralPath $hostLog.FullName) -match '"event":"xr_ready"'
-} until ($ready -or (Get-Date) -ge $deadline)
-if (-not $ready) {
-    Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue
-    throw 'OpenXR-Host wurde nicht innerhalb von 30 Sekunden bereit.'
 }
 
 # --- Spiel starten ----------------------------------------------------------
@@ -233,10 +316,21 @@ $gameArguments = @(
     '-userdirectory', "`"$($deployment.userDirectory)`"",
     '-fearvr-stereo-toggle'
 )
+if ($useD3D9ExCompatibility) {
+    $gameArguments += '-fearvr-d3d9ex-compat'
+}
+if ($D3D9ExExclusive) {
+    $gameArguments += '-fearvr-d3d9ex-exclusive'
+}
+if ($DesktopD3D9ExTest) {
+    $gameArguments += '-fearvr-d3d9ex-windowed-test'
+}
 if (-not $NoInput) { $gameArguments += '-fearvr-input' }
 if ($Translation) { $gameArguments += '-fearvr-translation' }
 if (-not $NoStereoHud) { $gameArguments += '-fearvr-stereo-hud' }
 if ($NoHeadBob) { $gameArguments += '-fearvr-no-headbob' }
+if ($NoGpuHud) { $gameArguments += '-fearvr-no-gpu-hud' }
+if ($MagentaSurfaceTest) { $gameArguments += '-fearvr-magenta-surface-test' }
 if ($Safe) { $gameArguments += '-fearvr-safe' }
 if ($NoFlashlight) { $gameArguments += '-fearvr-no-flashlight' }
 if ($NoHandNodes) { $gameArguments += '-fearvr-no-handnodes' }
@@ -271,7 +365,9 @@ do {
         Select-Object -First 1
 } until ($null -ne $fear -or (Get-Date) -ge $deadline)
 if ($null -eq $fear) {
-    Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue
+    if ($null -ne $hostProcess) {
+        Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue
+    }
     $startFailure = 'FEAR.exe war nach 25 Sekunden nicht gestartet.'
     if ($launchMode -eq 'steam') {
         $startFailure = 'Steam startete innerhalb von 25 Sekunden keine FEAR.exe.'
@@ -294,6 +390,10 @@ if ($usesSteamVr -and (Test-Path -LiteralPath $guardScript -PathType Leaf)) {
 
 Write-Host "F.E.A.R. laeuft (PID $($fear.Id))." -ForegroundColor Green
 Write-Host ''
+if ($DesktopD3D9ExTest) {
+    Write-Host 'Desktop-only D3D9Ex test: no frame is submitted to a headset.' `
+        -ForegroundColor Yellow
+}
 Write-Host 'Steuerung: linker Stick bewegt, rechter Stick dreht; hoch springt, runter duckt.'
 Write-Host 'A wechselt die Waffe; B laedt nach oder wirft gehalten eine Granate.'
 Write-Host 'X schaltet die Lampe, Y pausiert.'

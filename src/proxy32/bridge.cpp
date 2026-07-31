@@ -8,8 +8,10 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <Shellapi.h>
 #include <d3dcompiler.h>
@@ -17,6 +19,7 @@
 #include <MinHook.h>
 #include <wrl/client.h>
 
+#include "d3d9ex_compat.h"
 #include "fearvr-version.h"
 #include "ipc_names.h"
 #include "protocol_utils.h"
@@ -124,6 +127,9 @@ struct CommandLineConfig {
     // Pixel fuer Pixel auf der CPU. Der GPU-Weg zeichnet in das Geraet des
     // Spiels; bleibt danach etwas schwarz, trennt dieser Schalter die Ursache.
     bool disableGpuHud{false};
+    // Opt-in: veraendert genau ein Present-Bild fuer die Oberflaechenprobe.
+    // Ohne diesen Schalter wird kein Spielbild veraendert.
+    bool magentaSurfaceTest{false};
 };
 
 CommandLineConfig ReadConfig() noexcept {
@@ -161,6 +167,10 @@ CommandLineConfig ReadConfig() noexcept {
         } else if (_wcsicmp(
                        arguments[index], L"-fearvr-no-gpu-hud") == 0) {
             config.disableGpuHud = true;
+        } else if (_wcsicmp(
+                       arguments[index],
+                       L"-fearvr-magenta-surface-test") == 0) {
+            config.magentaSurfaceTest = true;
         }
     }
     LocalFree(arguments);
@@ -200,6 +210,26 @@ enum class TransferMode {
     DirectShared,
     CpuViaD3D9Ex
 };
+
+UINT SurfaceBytesPerPixel(D3DFORMAT format) noexcept {
+    switch (format) {
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
+    case D3DFMT_A2R10G10B10:
+    case D3DFMT_A2B10G10R10:
+    case D3DFMT_G16R16:
+        return 4;
+    case D3DFMT_R5G6B5:
+    case D3DFMT_X1R5G5B5:
+    case D3DFMT_A1R5G5B5:
+    case D3DFMT_A4R4G4B4:
+        return 2;
+    case D3DFMT_A8:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 // ============================================================================
 // GPU-Kompositor für das Stereo-HUD
@@ -809,8 +839,27 @@ public:
         logger_.Write(level, event, message);
     }
 
-    void CapturePresent(IDirect3DDevice9* device) noexcept {
-        if (device == nullptr || config_.sessionId == 0) {
+    bool ShouldDeferEndSceneCapture() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stereoAccepting_ || stereoFrameReady_;
+    }
+    bool ProbeDiagnosticSurface(
+        IDirect3DDevice9* device, IDirect3DSurface9* surface,
+        const char* name) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ProbeD3D9Surface(
+            device, surface, name, 0, 0);
+    }
+
+
+    void CapturePresent(
+        IDirect3DDevice9* device,
+        IDirect3DSurface9* presentedSurface,
+        IDirect3DSwapChain9* presentingSwapChain,
+        HWND destinationWindow,
+        const char* presentationPath) noexcept {
+        if (device == nullptr || presentedSurface == nullptr ||
+            config_.sessionId == 0) {
             return;
         }
         PollStereoToggle();
@@ -824,31 +873,67 @@ public:
         UpdateHostConnection();
         EnsureDeviceMetadata(device);
         UpdateAdapterMatch();
+        LogPresentSource(
+            device, presentedSurface, presentingSwapChain,
+            destinationWindow, presentationPath);
 
         if (!hostConnected_ ||
             (shared_->bridgeFlags & FEARVR_BF_ADAPTER_MATCH) == 0) {
             return;
         }
 
-        ComPtr<IDirect3DSurface9> backBuffer;
-        HRESULT result = device->GetBackBuffer(
-            0, 0, D3DBACKBUFFER_TYPE_MONO,
-            backBuffer.ReleaseAndGetAddressOf());
+        ComPtr<IDirect3DDevice9> surfaceDevice;
+        HRESULT result = presentedSurface->GetDevice(
+            surfaceDevice.ReleaseAndGetAddressOf());
         if (FAILED(result)) {
-            if (result == D3DERR_DEVICELOST) {
-                InterlockedOr(AtomicFlags(*shared_), FEARVR_BF_DEVICE_LOST);
-            }
-            LogHresult("get_backbuffer_failed", result);
+            LogHresult("present_surface_get_device_failed", result);
+            return;
+        }
+        if (surfaceDevice.Get() != device) {
+            logger_.Write(
+                "ERROR", "present_surface_device_mismatch",
+                "The presenting surface belongs to a different D3D9 device.");
             return;
         }
 
-        D3DSURFACE_DESC description{};
-        result = backBuffer->GetDesc(&description);
+        IDirect3DSurface9* captureSource = presentedSurface;
+        D3DSURFACE_DESC captureDescription{};
+        result = captureSource->GetDesc(&captureDescription);
+
         if (FAILED(result)) {
-            LogHresult("get_backbuffer_desc_failed", result);
+            LogHresult("present_surface_desc_failed", result);
             return;
         }
-        if (!EnsureResources(device, description.Width, description.Height)) {
+
+        ComPtr<IDirect3DSurface9> currentRenderTarget;
+        const HRESULT currentTargetResult = device->GetRenderTarget(
+            0, currentRenderTarget.ReleaseAndGetAddressOf());
+        if (FAILED(currentTargetResult)) {
+            LogHresult(
+                "present_current_render_target_failed",
+                currentTargetResult);
+        }
+        if (currentRenderTarget &&
+            preferredCaptureSource_.Get() == currentRenderTarget.Get()) {
+            D3DSURFACE_DESC preferredDescription{};
+            const HRESULT preferredResult =
+                currentRenderTarget->GetDesc(&preferredDescription);
+            if (SUCCEEDED(preferredResult) &&
+                preferredDescription.Width == captureDescription.Width &&
+                preferredDescription.Height == captureDescription.Height &&
+                preferredDescription.Format == captureDescription.Format) {
+                captureSource = currentRenderTarget.Get();
+                captureDescription = preferredDescription;
+            } else if (FAILED(preferredResult)) {
+                LogHresult(
+                    "preferred_capture_source_desc_failed",
+                    preferredResult);
+            }
+        }
+        if (!EnsureResources(
+                device, captureDescription.Width,
+                captureDescription.Height, captureDescription.Format,
+                captureDescription.MultiSampleType)) {
             return;
         }
         if (pending_.active) {
@@ -882,17 +967,90 @@ public:
             slot.generation = generation;
         }
 
+        if (!directProbeNonBlack_ &&
+            directProbeAttempts_ < 64 &&
+            (directProbeAttempts_ == 0 ||
+             generation >=
+                 static_cast<std::uint64_t>(directProbeAttempts_) * 30U)) {
+            ++directProbeAttempts_;
+            bool presentedProbeCompleted = false;
+            const bool presentedHasPixels = ProbeD3D9Surface(
+                device, presentedSurface, "presented_backbuffer",
+                frameId, generation, &presentedProbeCompleted);
+            bool currentHasPixels = false;
+            bool currentProbeCompleted = false;
+            if (currentRenderTarget &&
+                currentRenderTarget.Get() != presentedSurface) {
+                currentHasPixels = ProbeD3D9Surface(
+                    device, currentRenderTarget.Get(),
+                    "current_render_target", frameId, generation,
+                    &currentProbeCompleted);
+            }
+            directProbeNonBlack_ =
+                (presentedProbeCompleted && presentedHasPixels) ||
+                (currentProbeCompleted && currentHasPixels);
+            if (presentedProbeCompleted && !presentedHasPixels &&
+                currentProbeCompleted && currentHasPixels) {
+                D3DSURFACE_DESC currentDescription{};
+                const HRESULT descriptionResult =
+                    currentRenderTarget->GetDesc(&currentDescription);
+                if (SUCCEEDED(descriptionResult) &&
+                    currentDescription.Width == captureDescription.Width &&
+                    currentDescription.Height == captureDescription.Height &&
+                    currentDescription.Format == captureDescription.Format) {
+                    preferredCaptureSource_ = currentRenderTarget;
+                    captureSource = currentRenderTarget.Get();
+                    captureDescription = currentDescription;
+                    logger_.Write(
+                        "WARN", "capture_source_fallback",
+                        "The presenting backbuffer was black while render "
+                        "target 0 contained pixels; capture now follows the "
+                        "active final render target.");
+                } else if (FAILED(descriptionResult)) {
+                    LogHresult(
+                        "fallback_capture_source_desc_failed",
+                        descriptionResult);
+                }
+            }
+        }
+
+        if (config_.magentaSurfaceTest && !magentaTestDone_) {
+            magentaTestDone_ = true;
+            const HRESULT fillResult = device->ColorFill(
+                presentedSurface, nullptr,
+                D3DCOLOR_XRGB(255, 0, 255));
+            if (FAILED(fillResult)) {
+                LogHresult("magenta_surface_test_failed", fillResult);
+            } else {
+                logger_.Write(
+                    "WARN", "magenta_surface_test",
+                    "The exact surface passed to the next Present was "
+                    "filled magenta for one frame.");
+                ProbeD3D9Surface(
+                    device, presentedSurface, "presented_magenta",
+                    frameId, generation);
+            }
+        }
+
+        ComPtr<IDirect3DSurface9> resolvedCaptureSource;
+        if (!ResolveCaptureSource(
+                device, captureSource,
+                resolvedCaptureSource.ReleaseAndGetAddressOf())) {
+            ReleaseClaimedPair(slotIndex);
+            return;
+        }
+        captureSource = resolvedCaptureSource.Get();
         bool copied = false;
         stereoHudFlatFrame_ = false;
         if (stereo) {
             copied = transferMode_ == TransferMode::CpuViaD3D9Ex
                 ? CopyStereoFrameViaCpu(
-                      device, backBuffer.Get(), slotIndex)
+                      device, captureSource, slotIndex)
                 : CopyStereoFrameDirect(device, slotIndex);
         } else {
             copied = transferMode_ == TransferMode::CpuViaD3D9Ex
-                ? CopyFrameViaCpu(device, backBuffer.Get(), slotIndex)
-                : CopyFrameDirect(device, backBuffer.Get(), slotIndex);
+                ? CopyFrameViaCpu(device, captureSource, slotIndex)
+                : CopyFrameDirect(device, captureSource, slotIndex);
         }
 
         if (!copied) {
@@ -1249,25 +1407,49 @@ public:
             return;
         }
 
-        ComPtr<IDirect3DSurface9> backBuffer;
-        HRESULT result = device_->GetBackBuffer(
-            0, 0, D3DBACKBUFFER_TYPE_MONO,
-            backBuffer.ReleaseAndGetAddressOf());
+        ComPtr<IDirect3DSurface9> eyeSource;
+        HRESULT result = device_->GetRenderTarget(
+            0, eyeSource.ReleaseAndGetAddressOf());
         if (FAILED(result)) {
-            LogHresult("stereo_get_backbuffer_failed", result);
-            return;
+            LogHresult("stereo_get_render_target_failed", result);
+            ComPtr<IDirect3DSwapChain9> swapChain;
+            result = device_->GetSwapChain(
+                0, swapChain.ReleaseAndGetAddressOf());
+            if (FAILED(result) || !swapChain) {
+                LogHresult("stereo_get_swapchain_failed", result);
+                return;
+            }
+            result = swapChain->GetBackBuffer(
+                0, D3DBACKBUFFER_TYPE_MONO,
+                eyeSource.ReleaseAndGetAddressOf());
+            if (FAILED(result)) {
+                LogHresult(
+                    "stereo_get_presented_surface_failed", result);
+                return;
+            }
         }
         D3DSURFACE_DESC description{};
-        result = backBuffer->GetDesc(&description);
-        if (FAILED(result) || description.Width != width_ ||
+        result = eyeSource->GetDesc(&description);
+        if (FAILED(result)) {
+            LogHresult("stereo_source_desc_failed", result);
+            return;
+        }
+        if (description.Width != width_ ||
             description.Height != height_) {
             logger_.Write(
                 "WARN", "stereo_capture_size_changed",
                 "Stereo capture deferred until resources are recreated.");
             return;
         }
+        ComPtr<IDirect3DSurface9> resolvedEyeSource;
+        if (!ResolveCaptureSource(
+                device_, eyeSource.Get(),
+                resolvedEyeSource.ReleaseAndGetAddressOf())) {
+            return;
+        }
         result = device_->StretchRect(
-            backBuffer.Get(), nullptr, stereoCapture_[eye].Get(), nullptr,
+            resolvedEyeSource.Get(), nullptr,
+            stereoCapture_[eye].Get(), nullptr,
             D3DTEXF_NONE);
         if (FAILED(result)) {
             LogHresult("stereo_stage_copy_failed", result);
@@ -1881,9 +2063,11 @@ private:
     }
 
     bool EnsureResources(IDirect3DDevice9* device, UINT width,
-                         UINT height) noexcept {
+                         UINT height, D3DFORMAT sourceFormat,
+                         D3DMULTISAMPLE_TYPE sourceMultisample) noexcept {
         if (resourcesReady_ && width_ == width && height_ == height &&
-            device_ == device) {
+            sourceFormat_ == sourceFormat &&
+            sourceMultisample_ == sourceMultisample && device_ == device) {
             return true;
         }
         const ULONGLONG now = GetTickCount64();
@@ -1895,6 +2079,8 @@ private:
         device_ = device;
         width_ = width;
         height_ = height;
+        sourceFormat_ = sourceFormat;
+        sourceMultisample_ = sourceMultisample;
 
         ComPtr<IDirect3DDevice9Ex> deviceEx;
         bool created = false;
@@ -1903,9 +2089,51 @@ private:
             created = CreateSharedSlots(device, width, height);
             if (created) {
                 transferMode_ = TransferMode::DirectShared;
+                HRESULT resolveResult = device->CreateTexture(
+                    width, height, 1, D3DUSAGE_RENDERTARGET,
+                    sourceFormat, D3DPOOL_DEFAULT,
+                    directResolveTexture_.ReleaseAndGetAddressOf(),
+                    nullptr);
+                if (SUCCEEDED(resolveResult)) {
+                    resolveResult =
+                        directResolveTexture_->GetSurfaceLevel(
+                            0,
+                            directResolveSurface_
+                                .ReleaseAndGetAddressOf());
+                }
+                if (FAILED(resolveResult)) {
+                    LogHresult("direct_resolve_create_failed",
+                               resolveResult);
+                    created = false;
+                } else {
+                    logger_.Write(
+                        "INFO", "direct_resolve_ready",
+                        "Single-sample intermediate handles MSAA "
+                        "backbuffers before shared-texture copies.");
+                }
             }
         } else {
             created = CreateCpuInteropResources(device, width, height);
+        }
+        if (created && sourceMultisample != D3DMULTISAMPLE_NONE &&
+            !directResolveSurface_) {
+            HRESULT resolveResult = device->CreateTexture(
+                width, height, 1, D3DUSAGE_RENDERTARGET,
+                sourceFormat, D3DPOOL_DEFAULT,
+                directResolveTexture_.ReleaseAndGetAddressOf(), nullptr);
+            if (SUCCEEDED(resolveResult)) {
+                resolveResult = directResolveTexture_->GetSurfaceLevel(
+                    0, directResolveSurface_.ReleaseAndGetAddressOf());
+            }
+            if (FAILED(resolveResult)) {
+                LogHresult("cpu_resolve_create_failed", resolveResult);
+                created = false;
+            } else {
+                logger_.Write(
+                    "INFO", "cpu_resolve_ready",
+                    "The CPU transfer path has a matching single-sample "
+                    "MSAA resolve target.");
+            }
         }
         if (created) {
             created =
@@ -1942,13 +2170,89 @@ private:
         return true;
     }
 
+    bool ResolveCaptureSource(
+        IDirect3DDevice9* device, IDirect3DSurface9* source,
+        IDirect3DSurface9** output) noexcept {
+        if (device == nullptr || source == nullptr || output == nullptr) {
+            return false;
+        }
+        *output = nullptr;
+        D3DSURFACE_DESC sourceDescription{};
+        HRESULT result = source->GetDesc(&sourceDescription);
+        if (FAILED(result)) {
+            LogHresult("capture_source_desc_failed", result);
+            return false;
+        }
+        if (sourceDescription.MultiSampleType == D3DMULTISAMPLE_NONE) {
+            source->AddRef();
+            *output = source;
+            return true;
+        }
+        if (!directResolveSurface_) {
+            logger_.Write(
+                "ERROR", "capture_resolve_missing",
+                "A multisampled source has no resolve surface.");
+            return false;
+        }
+        D3DSURFACE_DESC resolveDescription{};
+        result = directResolveSurface_->GetDesc(&resolveDescription);
+        if (FAILED(result)) {
+            LogHresult("capture_resolve_desc_failed", result);
+            return false;
+        }
+        if (resolveDescription.Width != sourceDescription.Width ||
+            resolveDescription.Height != sourceDescription.Height ||
+            resolveDescription.Format != sourceDescription.Format ||
+            resolveDescription.MultiSampleType != D3DMULTISAMPLE_NONE) {
+            logger_.Write(
+                "ERROR", "capture_resolve_mismatch",
+                "MSAA source and resolve target dimensions or format differ.");
+            return false;
+        }
+        result = device->StretchRect(
+            source, nullptr, directResolveSurface_.Get(), nullptr,
+            D3DTEXF_NONE);
+        if (FAILED(result)) {
+            LogHresult("capture_msaa_resolve_failed", result);
+            return false;
+        }
+        directResolveSurface_->AddRef();
+        *output = directResolveSurface_.Get();
+        if (!resolvedProbeDone_) {
+            resolvedProbeDone_ = true;
+            ProbeD3D9Surface(
+                device, directResolveSurface_.Get(), "resolved_intermediate",
+                frameId_, generation_);
+        }
+        return true;
+    }
+
     bool CopyFrameDirect(IDirect3DDevice9* device,
                          IDirect3DSurface9* backBuffer,
                          std::uint32_t slotIndex) noexcept {
+        IDirect3DSurface9* source = backBuffer;
+        D3DSURFACE_DESC sourceDescription{};
+        HRESULT result = backBuffer->GetDesc(&sourceDescription);
+        if (FAILED(result)) {
+            LogHresult("direct_source_desc_failed", result);
+            return false;
+        }
+        if (sourceDescription.MultiSampleType !=
+            D3DMULTISAMPLE_NONE) {
+            result = device->StretchRect(
+                backBuffer, nullptr, directResolveSurface_.Get(),
+                nullptr, D3DTEXF_NONE);
+            if (FAILED(result)) {
+                LogHresult("direct_msaa_resolve_failed", result);
+                return false;
+            }
+            source = directResolveSurface_.Get();
+        }
+
         for (std::uint32_t eye = 0; eye < FEARVR_EYE_COUNT; ++eye) {
             SlotResource& resource = resources_[eye][slotIndex];
-            HRESULT result = device->StretchRect(
-                backBuffer, nullptr, resource.surface.Get(), nullptr,
+            result = device->StretchRect(
+                source, nullptr, resource.surface.Get(), nullptr,
                 D3DTEXF_NONE);
             if (FAILED(result)) {
                 LogHresult("stretch_rect_failed", result);
@@ -2360,6 +2664,10 @@ private:
         pending_ = {};
         resourcesReady_ = false;
         transferMode_ = TransferMode::None;
+        sourceFormat_ = D3DFMT_UNKNOWN;
+        sourceMultisample_ = D3DMULTISAMPLE_NONE;
+        resolvedProbeDone_ = false;
+        preferredCaptureSource_.Reset();
         // Zuerst der Kompositor: Er hält Render-Targets auf demselben Gerät.
         hudCompositor_.Release();
         for (std::uint32_t eye = 0; eye < FEARVR_EYE_COUNT; ++eye) {
@@ -2389,6 +2697,9 @@ private:
         presentedReadback_.Reset();
         rightWorldReadback_.Reset();
         gameReadback_.Reset();
+        directProbeReadback_.Reset();
+        directResolveSurface_.Reset();
+        directResolveTexture_.Reset();
         gameCapture_.Reset();
         gameCaptureTexture_.Reset();
         ClearStereoFrame();
@@ -2457,6 +2768,14 @@ private:
                 return false;
             }
         }
+        if (transferMode_ == TransferMode::DirectShared &&
+            directProbeGeneration_ == pending_.generation) {
+            ProbeD3D9Surface(
+                device_,
+                resources_[FEARVR_EYE_LEFT][pending_.slotIndex].surface.Get(),
+                "shared", pending_.frameId, pending_.generation);
+            directProbeGeneration_ = 0;
+        }
 
         MemoryBarrier();
         for (std::uint32_t eye = 0; eye < FEARVR_EYE_COUNT; ++eye) {
@@ -2475,6 +2794,329 @@ private:
         }
         pending_ = {};
         return true;
+    }
+
+    void LogPresentSource(
+        IDirect3DDevice9* device, IDirect3DSurface9* surface,
+        IDirect3DSwapChain9* swapChain, HWND destinationWindow,
+        const char* path) noexcept {
+        void* const identity = swapChain != nullptr
+            ? static_cast<void*>(swapChain)
+            : static_cast<void*>(surface);
+        for (std::size_t index = 0; index < loggedPresentSourceCount_;
+             ++index) {
+            if (loggedPresentSources_[index] == identity) {
+                return;
+            }
+        }
+        if (loggedPresentSourceCount_ < loggedPresentSources_.size()) {
+            loggedPresentSources_[loggedPresentSourceCount_++] = identity;
+        }
+
+        D3DSURFACE_DESC description{};
+        const HRESULT descriptionResult = surface->GetDesc(&description);
+        D3DPRESENT_PARAMETERS parameters{};
+        const HRESULT parametersResult = swapChain != nullptr
+            ? swapChain->GetPresentParameters(&parameters)
+            : D3DERR_INVALIDCALL;
+        if (destinationWindow == nullptr && SUCCEEDED(parametersResult)) {
+            destinationWindow = parameters.hDeviceWindow;
+        }
+        if (destinationWindow == nullptr) {
+            D3DDEVICE_CREATION_PARAMETERS creation{};
+            const HRESULT creationResult =
+                device->GetCreationParameters(&creation);
+            if (SUCCEEDED(creationResult)) {
+                destinationWindow = creation.hFocusWindow;
+            } else {
+                LogHresult("present_device_creation_params_failed",
+                           creationResult);
+            }
+        }
+        char title[256]{};
+        if (destinationWindow != nullptr) {
+            GetWindowTextA(destinationWindow, title,
+                           static_cast<int>(sizeof(title)));
+        }
+
+        std::ostringstream message;
+        message << "path=" << (path == nullptr ? "unknown" : path)
+                << " swapchain=0x" << std::hex
+                << reinterpret_cast<std::uintptr_t>(swapChain)
+                << " device=0x"
+                << reinterpret_cast<std::uintptr_t>(device)
+                << " backbuffer=0x"
+                << reinterpret_cast<std::uintptr_t>(surface)
+                << " hwnd=0x"
+                << reinterpret_cast<std::uintptr_t>(destinationWindow)
+                << " desc_hr=0x"
+                << static_cast<std::uint32_t>(descriptionResult)
+                << " present_params_hr=0x"
+                << static_cast<std::uint32_t>(parametersResult)
+                << std::dec << " title=" << title
+                << " size=" << description.Width << 'x'
+                << description.Height << " format="
+                << static_cast<unsigned>(description.Format)
+                << " msaa="
+                << static_cast<unsigned>(description.MultiSampleType)
+                << " swap_effect="
+                << static_cast<unsigned>(parameters.SwapEffect);
+        logger_.Write(
+            SUCCEEDED(descriptionResult) ? "INFO" : "ERROR",
+            "d3d9_present_source", message.str());
+    }
+
+    bool ProbeD3D9Surface(IDirect3DDevice9* device,
+                          IDirect3DSurface9* surface,
+                          const char* surfaceName,
+                          std::uint64_t frameId,
+                          std::uint64_t generation,
+                          bool* probeCompleted = nullptr) noexcept {
+        if (probeCompleted != nullptr) {
+            *probeCompleted = false;
+        }
+        if (device == nullptr || surface == nullptr) {
+            return false;
+        }
+
+        D3DSURFACE_DESC sourceDescription{};
+        HRESULT result = surface->GetDesc(&sourceDescription);
+        if (FAILED(result)) {
+            LogHresult("d3d9_pixel_probe_desc_failed", result);
+            return false;
+        }
+        if (sourceDescription.MultiSampleType !=
+            D3DMULTISAMPLE_NONE) {
+            if (!directResolveSurface_) {
+                logger_.Write(
+                    "ERROR", "d3d9_pixel_probe_resolve_missing",
+                    "MSAA surface has no single-sample resolve target.");
+                return false;
+            }
+            result = device->StretchRect(
+                surface, nullptr, directResolveSurface_.Get(),
+                nullptr, D3DTEXF_NONE);
+            if (FAILED(result)) {
+                LogHresult("d3d9_pixel_probe_resolve_failed", result);
+                return false;
+            }
+            surface = directResolveSurface_.Get();
+            result = surface->GetDesc(&sourceDescription);
+            if (FAILED(result)) {
+                LogHresult("d3d9_pixel_probe_resolve_desc_failed",
+                           result);
+                return false;
+            }
+        }
+        if (sourceDescription.MultiSampleType !=
+            D3DMULTISAMPLE_NONE) {
+            logger_.Write(
+                "ERROR", "d3d9_pixel_probe_source_still_msaa",
+                "GetRenderTargetData requires a single-sample source.");
+            return false;
+        }
+        D3DSURFACE_DESC readbackDescription{};
+        HRESULT readbackDescriptionResult = directProbeReadback_
+            ? directProbeReadback_->GetDesc(&readbackDescription)
+            : D3DERR_INVALIDCALL;
+        if (directProbeReadback_ &&
+            FAILED(readbackDescriptionResult)) {
+            LogHresult(
+                "d3d9_pixel_probe_readback_desc_failed",
+                readbackDescriptionResult);
+        }
+        bool readbackMatches =
+            directProbeReadback_ &&
+            SUCCEEDED(readbackDescriptionResult) &&
+            readbackDescription.Width == sourceDescription.Width &&
+            readbackDescription.Height == sourceDescription.Height &&
+            readbackDescription.Format == sourceDescription.Format &&
+            readbackDescription.Pool == D3DPOOL_SYSTEMMEM;
+        if (!readbackMatches) {
+            directProbeReadback_.Reset();
+            result = device->CreateOffscreenPlainSurface(
+                sourceDescription.Width, sourceDescription.Height,
+                sourceDescription.Format, D3DPOOL_SYSTEMMEM,
+                directProbeReadback_.ReleaseAndGetAddressOf(),
+                nullptr);
+            if (FAILED(result)) {
+                LogHresult("d3d9_pixel_probe_create_failed", result);
+                return false;
+            }
+            readbackDescriptionResult =
+                directProbeReadback_->GetDesc(&readbackDescription);
+            if (FAILED(readbackDescriptionResult)) {
+                LogHresult(
+                    "d3d9_pixel_probe_created_desc_failed",
+                    readbackDescriptionResult);
+                return false;
+            }
+            readbackMatches =
+                readbackDescription.Width == sourceDescription.Width &&
+                readbackDescription.Height == sourceDescription.Height &&
+                readbackDescription.Format == sourceDescription.Format &&
+                readbackDescription.Pool == D3DPOOL_SYSTEMMEM;
+            if (!readbackMatches) {
+                logger_.Write(
+                    "ERROR", "d3d9_pixel_probe_readback_mismatch",
+                    "The system-memory readback does not match the source "
+                    "dimensions, format, and pool.");
+                return false;
+            }
+        }
+
+        const UINT bytesPerPixel =
+            SurfaceBytesPerPixel(sourceDescription.Format);
+        if (bytesPerPixel == 0) {
+            logger_.Write(
+                "ERROR", "d3d9_pixel_probe_format_unsupported",
+                "The readback sentinel cannot size this pixel format.");
+            return false;
+        }
+        const std::size_t rowBytes =
+            static_cast<std::size_t>(sourceDescription.Width) * bytesPerPixel;
+        D3DLOCKED_RECT sentinel{};
+        result = directProbeReadback_->LockRect(&sentinel, nullptr, 0);
+        if (FAILED(result)) {
+            LogHresult("d3d9_pixel_probe_sentinel_lock_failed", result);
+            return false;
+        }
+        if (sentinel.Pitch < 0 ||
+            static_cast<std::size_t>(sentinel.Pitch) < rowBytes) {
+            directProbeReadback_->UnlockRect();
+            logger_.Write(
+                "ERROR", "d3d9_pixel_probe_pitch_invalid",
+                "The system-memory readback pitch is smaller than one row.");
+            return false;
+        }
+        auto* sentinelRow = static_cast<std::uint8_t*>(sentinel.pBits);
+        for (UINT row = 0; row < sourceDescription.Height; ++row) {
+            std::memset(sentinelRow, 0xCD, rowBytes);
+            sentinelRow += sentinel.Pitch;
+        }
+        result = directProbeReadback_->UnlockRect();
+        if (FAILED(result)) {
+            LogHresult("d3d9_pixel_probe_sentinel_unlock_failed", result);
+            return false;
+        }
+
+        const HRESULT copyResult = device->GetRenderTargetData(
+            surface, directProbeReadback_.Get());
+        if (FAILED(copyResult)) {
+            std::ostringstream message;
+            message << "surface=" << surfaceName
+                    << " HRESULT=0x" << std::hex << std::uppercase
+                    << static_cast<std::uint32_t>(copyResult)
+                    << " format=" << std::dec
+                    << static_cast<unsigned>(sourceDescription.Format)
+                    << " multisample="
+                    << static_cast<unsigned>(
+                           sourceDescription.MultiSampleType);
+            logger_.Write("ERROR", "d3d9_pixel_probe_copy_failed",
+                          message.str());
+            return false;
+        }
+
+        D3DLOCKED_RECT mapped{};
+        const HRESULT lockResult = directProbeReadback_->LockRect(
+            &mapped, nullptr, D3DLOCK_READONLY);
+        if (FAILED(lockResult)) {
+            LogHresult("d3d9_pixel_probe_lock_failed", lockResult);
+            return false;
+        }
+
+        std::uint64_t totalBytes = 0;
+        std::uint64_t sentinelBytes = 0;
+        std::uint64_t zeroBytes = 0;
+        for (UINT y = 0; y < sourceDescription.Height; ++y) {
+            const auto* row =
+                static_cast<const std::uint8_t*>(mapped.pBits) +
+                static_cast<std::size_t>(y) * mapped.Pitch;
+            for (std::size_t offset = 0; offset < rowBytes; ++offset) {
+                sentinelBytes += row[offset] == 0xCD ? 1U : 0U;
+                zeroBytes += row[offset] == 0 ? 1U : 0U;
+                ++totalBytes;
+            }
+        }
+        if (totalBytes != 0 && sentinelBytes == totalBytes) {
+            const HRESULT unlockResult =
+                directProbeReadback_->UnlockRect();
+            if (FAILED(unlockResult)) {
+                LogHresult(
+                    "d3d9_pixel_probe_unlock_failed", unlockResult);
+            }
+            logger_.Write(
+                "ERROR", "d3d9_pixel_probe_sentinel_unchanged",
+                "GetRenderTargetData reported success but left every byte "
+                "at the 0xCD sentinel value.");
+            return false;
+        }
+        const char* const readbackState =
+            totalBytes != 0 && zeroBytes == totalBytes
+                ? "all_zero"
+                : "mixed";
+
+        const UINT stepX =
+            (std::max)(1U, sourceDescription.Width / 64U);
+        const UINT stepY =
+            (std::max)(1U, sourceDescription.Height / 64U);
+        std::uint64_t samples = 0;
+        std::uint64_t nonBlackSamples = 0;
+        std::uint64_t blue = 0;
+        std::uint64_t green = 0;
+        std::uint64_t red = 0;
+        for (UINT y = 0; y < sourceDescription.Height;
+             y += stepY) {
+            const auto* row =
+                static_cast<const std::uint8_t*>(mapped.pBits) +
+                static_cast<std::size_t>(y) * mapped.Pitch;
+            for (UINT x = 0; x < sourceDescription.Width;
+                x += stepX) {
+                const auto* pixel =
+                    row + static_cast<std::size_t>(x) * bytesPerPixel;
+                blue += pixel[0];
+                green += bytesPerPixel > 1 ? pixel[1] : 0;
+                red += bytesPerPixel > 2 ? pixel[2] : 0;
+                bool nonBlack = false;
+                const UINT colorBytes =
+                    bytesPerPixel == 4 ? 3U : bytesPerPixel;
+                for (UINT channel = 0; channel < colorBytes;
+                     ++channel) {
+                    nonBlack = nonBlack || pixel[channel] != 0;
+                }
+                nonBlackSamples += nonBlack ? 1U : 0U;
+                ++samples;
+            }
+        }
+        const HRESULT unlockResult = directProbeReadback_->UnlockRect();
+        if (FAILED(unlockResult)) {
+            LogHresult("d3d9_pixel_probe_unlock_failed", unlockResult);
+            return false;
+        }
+
+        std::ostringstream message;
+        message << "surface=" << surfaceName
+                << " frame=" << frameId
+                << " generation=" << generation
+                << " attempt=" << directProbeAttempts_
+                << " samples=" << samples
+                << " nonzero_samples=" << nonBlackSamples
+                << " readback_state=" << readbackState
+                << " sentinel_bytes=" << sentinelBytes
+                << " avg_bgr=";
+        if (samples == 0) {
+            message << "0,0,0";
+        } else {
+            message << blue / samples << ','
+                    << green / samples << ','
+                    << red / samples;
+        }
+        logger_.Write(nonBlackSamples == 0 ? "WARN" : "INFO",
+                      "d3d9_pixel_probe", message.str());
+        if (probeCompleted != nullptr) {
+            *probeCompleted = true;
+        }
+        return nonBlackSamples != 0;
     }
 
     void LogHresult(const char* event, HRESULT result) noexcept {
@@ -2504,6 +3146,10 @@ private:
     ComPtr<IDirect3DSurface9> gameReadback_;
     ComPtr<IDirect3DSurface9> rightWorldReadback_;
     ComPtr<IDirect3DSurface9> presentedReadback_;
+    ComPtr<IDirect3DSurface9> directProbeReadback_;
+    ComPtr<IDirect3DTexture9> directResolveTexture_;
+    ComPtr<IDirect3DSurface9> directResolveSurface_;
+    ComPtr<IDirect3DSurface9> preferredCaptureSource_;
     ComPtr<IDirect3DSurface9> bridgeUpload_;
     std::array<ComPtr<IDirect3DTexture9>, FEARVR_EYE_COUNT>
         stereoCaptureTexture_{};
@@ -2516,6 +3162,10 @@ private:
     PendingFrame pending_{};
     UINT width_{0};
     UINT height_{0};
+    D3DFORMAT sourceFormat_{D3DFMT_UNKNOWN};
+    D3DMULTISAMPLE_TYPE sourceMultisample_{D3DMULTISAMPLE_NONE};
+    std::array<void*, 32> loggedPresentSources_{};
+    std::size_t loggedPresentSourceCount_{0};
     std::uint32_t nextSlot_{0};
     std::uint64_t frameId_{0};
     std::uint64_t generation_{0};
@@ -2542,6 +3192,11 @@ private:
     bool stereoKeyWasDown_{false};
     bool recenterKeyWasDown_{false};
     bool comfortKeyWasDown_{false};
+    std::uint32_t directProbeAttempts_{0};
+    bool directProbeNonBlack_{false};
+    std::uint64_t directProbeGeneration_{0};
+    bool resolvedProbeDone_{false};
+    bool magentaTestDone_{false};
     bool comfortModeEnabled_{false};
     bool menuActive_{false};
     std::uint32_t recenterGeneration_{0};
@@ -2564,12 +3219,67 @@ using CreateDeviceFunction = HRESULT(STDMETHODCALLTYPE*)(
 using CreateDeviceExFunction = HRESULT(STDMETHODCALLTYPE*)(
     IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD,
     D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9Ex**);
+using CreateTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+    IDirect3DTexture9**, HANDLE*);
+using CreateVolumeTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT,
+    D3DPOOL, IDirect3DVolumeTexture9**, HANDLE*);
+using CreateCubeTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+    IDirect3DCubeTexture9**, HANDLE*);
+using CreateVertexBufferFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, DWORD, DWORD, D3DPOOL,
+    IDirect3DVertexBuffer9**, HANDLE*);
+using CreateIndexBufferFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, DWORD, D3DFORMAT, D3DPOOL,
+    IDirect3DIndexBuffer9**, HANDLE*);
 using ResetFunction =
     HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,
                                 D3DPRESENT_PARAMETERS*);
 using PresentFunction =
     HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*,
                                 const RECT*, HWND, const RGNDATA*);
+using CreateAdditionalSwapChainFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, D3DPRESENT_PARAMETERS*, IDirect3DSwapChain9**);
+using GetSwapChainFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, IDirect3DSwapChain9**);
+using SwapChainPresentFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DSwapChain9*, const RECT*, const RECT*, HWND,
+    const RGNDATA*, DWORD);
+using ClearFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR,
+    float, DWORD);
+using EndSceneFunction =
+    HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*);
+using DrawPrimitiveFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+using DrawIndexedPrimitiveFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+using DrawPrimitiveUpFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+using DrawIndexedPrimitiveUpFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT,
+    const void*, D3DFORMAT, const void*, UINT);
+using SetIndicesFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, IDirect3DIndexBuffer9*);
+using IndexBufferLockFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DIndexBuffer9*, UINT, UINT, void**, DWORD);
+using SetRenderTargetFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+using StretchRectFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, IDirect3DSurface9*, const RECT*,
+    IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE);
+
+
+using ResetExFunction =
+    HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9Ex*,
+                                D3DPRESENT_PARAMETERS*,
+                                D3DDISPLAYMODEEX*);
+using PresentExFunction =
+    HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9Ex*, const RECT*,
+                                const RECT*, HWND, const RGNDATA*,
+                                DWORD);
 
 void ForceHighQualitySource(D3DPRESENT_PARAMETERS* parameters) noexcept {
     // Keep Retail's own display mode. The game menu relies on that mode's
@@ -2587,16 +3297,89 @@ struct DeviceVtableRecord {
     void** vtable{nullptr};
     ResetFunction reset{nullptr};
     PresentFunction present{nullptr};
+    CreateAdditionalSwapChainFunction createAdditionalSwapChain{nullptr};
+    GetSwapChainFunction getSwapChain{nullptr};
+    ResetExFunction resetEx{nullptr};
+    PresentExFunction presentEx{nullptr};
+    CreateTextureFunction createTexture{nullptr};
+    CreateVolumeTextureFunction createVolumeTexture{nullptr};
+    CreateCubeTextureFunction createCubeTexture{nullptr};
+    CreateVertexBufferFunction createVertexBuffer{nullptr};
+    CreateIndexBufferFunction createIndexBuffer{nullptr};
+};
+
+struct SwapChainVtableRecord {
+    void** vtable{nullptr};
+    SwapChainPresentFunction present{nullptr};
 };
 
 SRWLOCK g_hookLock = SRWLOCK_INIT;
+SRWLOCK g_appLocalHookLock = SRWLOCK_INIT;
 std::array<D3D9VtableRecord, 8> g_d3d9Records{};
 std::array<DeviceVtableRecord, 8> g_deviceRecords{};
+std::array<SwapChainVtableRecord, 8> g_swapChainRecords{};
 INIT_ONCE g_lateHookOnce = INIT_ONCE_STATIC_INIT;
 volatile LONG g_lateHooksActive = FALSE;
 BOOL g_lateHookResult = FALSE;
 ResetFunction g_lateReset = nullptr;
 PresentFunction g_latePresent = nullptr;
+ResetFunction g_appLocalReset = nullptr;
+PresentFunction g_appLocalPresent = nullptr;
+EndSceneFunction g_appLocalEndScene = nullptr;
+volatile LONG g_managedResourceTranslationLogged = FALSE;
+ClearFunction g_appLocalClear = nullptr;
+DrawPrimitiveFunction g_appLocalDrawPrimitive = nullptr;
+DrawIndexedPrimitiveFunction g_appLocalDrawIndexedPrimitive = nullptr;
+DrawPrimitiveUpFunction g_appLocalDrawPrimitiveUp = nullptr;
+DrawIndexedPrimitiveUpFunction g_appLocalDrawIndexedPrimitiveUp = nullptr;
+SetIndicesFunction g_appLocalSetIndices = nullptr;
+IndexBufferLockFunction g_managedIndexBufferLock = nullptr;
+SetRenderTargetFunction g_appLocalSetRenderTarget = nullptr;
+StretchRectFunction g_appLocalStretchRect = nullptr;
+volatile LONG g_setRenderTargetTraceCount = 0;
+volatile LONG g_stretchRectTraceCount = 0;
+volatile LONG g_clearLogged = FALSE;
+volatile LONG g_drawPrimitiveLogged = FALSE;
+volatile LONG g_drawIndexedPrimitiveLogged = FALSE;
+volatile LONG g_drawPrimitiveUpLogged = FALSE;
+volatile LONG g_drawIndexedPrimitiveUpLogged = FALSE;
+volatile LONG g_renderActivitySequence = 0;
+volatile LONG g_lastClearSequence = 0;
+volatile LONG g_lastEndSceneSequence = 0;
+volatile LONG g_lastDrawSequence = 0;
+volatile LONG g_lastFullscreenDrawSequence = 0;
+void* volatile g_lastFullscreenTextureSurface = nullptr;
+volatile LONG g_endSceneLogged = FALSE;
+volatile LONG g_endSceneAfterDrawLogged = FALSE;
+volatile LONG g_endSceneCaptureLogged = FALSE;
+volatile LONG g_lastEndSceneCaptureDrawSequence = 0;
+volatile LONG g_fullscreenTextureProbePasses = 0;
+volatile LONG g_useFullscreenTextureCapture = FALSE;
+volatile LONG g_fullscreenTextureCaptureLogged = FALSE;
+volatile LONG g_fullscreenTextureDescriptionLogged = FALSE;
+volatile LONG g_presentOrderLogged = FALSE;
+volatile LONG g_presentCaptureSuppressedLogged = FALSE;
+void* volatile g_lastDrawDevice = nullptr;
+void* volatile g_managedIndexBuffer = nullptr;
+volatile LONG g_managedIndexCreateDetailsLogged = FALSE;
+volatile LONG g_managedIndexLockLogged = FALSE;
+volatile LONG g_managedIndexSetLogged = FALSE;
+volatile LONG g_swapChainHookLogged = FALSE;
+thread_local bool g_endSceneCaptureActive = false;
+LONG g_managedResourceSuccessLogged[5]{};
+struct TrackedRenderTarget {
+    IDirect3DDevice9* device{nullptr};
+    IDirect3DSurface9* surface{nullptr};
+    LONG id{0};
+};
+SRWLOCK g_renderTargetTraceLock = SRWLOCK_INIT;
+std::array<TrackedRenderTarget, 64> g_engineRenderTargets{};
+volatile LONG g_engineRenderTargetCount = 0;
+volatile LONG g_engineSurfaceProbeCadence = 0;
+volatile LONG g_engineSurfaceProbeCursor = 0;
+void* volatile g_selectedEngineRenderTarget = nullptr;
+volatile LONG g_engineRenderTargetCaptureLogged = FALSE;
+
 
 HRESULT STDMETHODCALLTYPE HookCreateDevice(
     IDirect3D9* self, UINT adapter, D3DDEVTYPE deviceType,
@@ -2609,6 +3392,35 @@ HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(
     D3DPRESENT_PARAMETERS* parameters,
     D3DDISPLAYMODEEX* fullscreenMode,
     IDirect3DDevice9Ex** output);
+HRESULT STDMETHODCALLTYPE HookCreateAdditionalSwapChain(
+    IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters,
+    IDirect3DSwapChain9** output);
+HRESULT STDMETHODCALLTYPE HookGetSwapChain(
+    IDirect3DDevice9* self, UINT index, IDirect3DSwapChain9** output);
+HRESULT STDMETHODCALLTYPE HookSwapChainPresent(
+    IDirect3DSwapChain9* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion, DWORD flags);
+HRESULT STDMETHODCALLTYPE HookCreateTexture(
+    IDirect3DDevice9* self, UINT width, UINT height, UINT levels,
+    DWORD usage, D3DFORMAT format, D3DPOOL pool,
+    IDirect3DTexture9** output, HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateVolumeTexture(
+    IDirect3DDevice9* self, UINT width, UINT height, UINT depth,
+    UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+    IDirect3DVolumeTexture9** output, HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateCubeTexture(
+    IDirect3DDevice9* self, UINT edgeLength, UINT levels, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture9** output,
+    HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateVertexBuffer(
+    IDirect3DDevice9* self, UINT length, DWORD usage, DWORD fvf,
+    D3DPOOL pool, IDirect3DVertexBuffer9** output,
+    HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateIndexBuffer(
+    IDirect3DDevice9* self, UINT length, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DIndexBuffer9** output,
+    HANDLE* sharedHandle);
 HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* self,
                                      D3DPRESENT_PARAMETERS* parameters);
 HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* self,
@@ -2616,6 +3428,52 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* self,
                                        const RECT* destination,
                                        HWND overrideWindow,
                                        const RGNDATA* dirtyRegion);
+HRESULT STDMETHODCALLTYPE HookResetEx(
+    IDirect3DDevice9Ex* self, D3DPRESENT_PARAMETERS* parameters,
+    D3DDISPLAYMODEEX* fullscreenMode);
+HRESULT STDMETHODCALLTYPE HookPresentEx(
+    IDirect3DDevice9Ex* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion, DWORD flags);
+HRESULT STDMETHODCALLTYPE HookAppLocalReset(
+    IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters);
+HRESULT STDMETHODCALLTYPE HookAppLocalPresent(
+    IDirect3DDevice9* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion);
+HRESULT STDMETHODCALLTYPE HookAppLocalClear(
+    IDirect3DDevice9* self, DWORD count, const D3DRECT* rectangles,
+    DWORD flags, D3DCOLOR color, float depth, DWORD stencil);
+HRESULT STDMETHODCALLTYPE HookAppLocalEndScene(IDirect3DDevice9* self);
+HRESULT STDMETHODCALLTYPE HookAppLocalDrawPrimitive(
+    IDirect3DDevice9* self, D3DPRIMITIVETYPE primitiveType,
+    UINT startVertex, UINT primitiveCount);
+HRESULT STDMETHODCALLTYPE HookAppLocalDrawIndexedPrimitive(
+    IDirect3DDevice9* self, D3DPRIMITIVETYPE primitiveType,
+    INT baseVertexIndex, UINT minimumVertexIndex, UINT vertexCount,
+    UINT startIndex, UINT primitiveCount);
+HRESULT STDMETHODCALLTYPE HookAppLocalDrawPrimitiveUp(
+    IDirect3DDevice9* self, D3DPRIMITIVETYPE primitiveType,
+    UINT primitiveCount, const void* vertexStreamZeroData,
+    UINT vertexStreamZeroStride);
+HRESULT STDMETHODCALLTYPE HookAppLocalDrawIndexedPrimitiveUp(
+    IDirect3DDevice9* self, D3DPRIMITIVETYPE primitiveType,
+    UINT minimumVertexIndex, UINT vertexCount, UINT primitiveCount,
+    const void* indexData, D3DFORMAT indexDataFormat,
+    const void* vertexStreamZeroData, UINT vertexStreamZeroStride);
+HRESULT STDMETHODCALLTYPE HookAppLocalSetIndices(
+    IDirect3DDevice9* self, IDirect3DIndexBuffer9* indexBuffer);
+HRESULT STDMETHODCALLTYPE HookAppLocalSetRenderTarget(
+    IDirect3DDevice9* self, DWORD index, IDirect3DSurface9* surface);
+HRESULT STDMETHODCALLTYPE HookAppLocalStretchRect(
+    IDirect3DDevice9* self, IDirect3DSurface9* source,
+    const RECT* sourceRect, IDirect3DSurface9* destination,
+    const RECT* destinationRect, D3DTEXTUREFILTERTYPE filter);
+
+HRESULT STDMETHODCALLTYPE HookManagedIndexBufferLock(
+    IDirect3DIndexBuffer9* self, UINT offset, UINT size, void** data,
+    DWORD flags);
+
 HRESULT STDMETHODCALLTYPE HookLateReset(
     IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters);
 HRESULT STDMETHODCALLTYPE HookLatePresent(
@@ -2639,37 +3497,277 @@ bool ReplaceVtableEntry(void** vtable, std::size_t index,
     return true;
 }
 
-void PatchDevice(IDirect3DDevice9* device) noexcept {
-    if (device == nullptr) {
+bool InstallAppLocalImplementationHooks(
+    void* resetTarget, void* presentTarget, void* clearTarget,
+    void* endSceneTarget, void* drawPrimitiveTarget,
+    void* drawIndexedPrimitiveTarget, void* drawPrimitiveUpTarget,
+    void* drawIndexedPrimitiveUpTarget, void* setIndicesTarget,
+    void* setRenderTargetTarget, void* stretchRectTarget) noexcept {
+    if (resetTarget == nullptr || presentTarget == nullptr) {
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&g_appLocalHookLock);
+    if (g_appLocalReset != nullptr && g_appLocalPresent != nullptr) {
+        ReleaseSRWLockExclusive(&g_appLocalHookLock);
+        return true;
+    }
+
+    auto fail = [&](const char* event, MH_STATUS status) {
+        g_appLocalReset = nullptr;
+        g_appLocalPresent = nullptr;
+        ReleaseSRWLockExclusive(&g_appLocalHookLock);
+        GetBridge().LogHookStatus(
+            "ERROR", event, MH_StatusToString(status));
+        return false;
+    };
+
+    const MH_STATUS initialize = MH_Initialize();
+    if (initialize != MH_OK &&
+        initialize != MH_ERROR_ALREADY_INITIALIZED) {
+        return fail("app_local_hook_initialize_failed", initialize);
+    }
+
+    MH_STATUS status = MH_CreateHook(
+        resetTarget,
+        reinterpret_cast<void*>(&HookAppLocalReset),
+        reinterpret_cast<void**>(&g_appLocalReset));
+    if (status != MH_OK) {
+        return fail("app_local_reset_hook_failed", status);
+    }
+
+    status = MH_CreateHook(
+        presentTarget,
+        reinterpret_cast<void*>(&HookAppLocalPresent),
+        reinterpret_cast<void**>(&g_appLocalPresent));
+    if (status != MH_OK) {
+        MH_RemoveHook(resetTarget);
+        return fail("app_local_present_hook_failed", status);
+    }
+
+    status = MH_QueueEnableHook(resetTarget);
+    if (status == MH_OK) {
+        status = MH_QueueEnableHook(presentTarget);
+    }
+    if (status == MH_OK) {
+        status = MH_ApplyQueued();
+    }
+    if (status != MH_OK) {
+        MH_RemoveHook(presentTarget);
+        MH_RemoveHook(resetTarget);
+        return fail("app_local_hook_enable_failed", status);
+    }
+
+    ReleaseSRWLockExclusive(&g_appLocalHookLock);
+    const auto installDiagnosticHook = [](
+        void* target, void* detour, void** original,
+        const char* failureEvent) {
+        MH_STATUS diagnosticStatus =
+            MH_CreateHook(target, detour, original);
+        if (diagnosticStatus == MH_OK) {
+            diagnosticStatus = MH_EnableHook(target);
+        }
+        if (diagnosticStatus != MH_OK) {
+            *original = nullptr;
+            GetBridge().LogHookStatus(
+                "WARN", failureEvent,
+                MH_StatusToString(diagnosticStatus));
+        }
+    };
+    installDiagnosticHook(
+        clearTarget, reinterpret_cast<void*>(&HookAppLocalClear),
+        reinterpret_cast<void**>(&g_appLocalClear),
+        "app_local_clear_probe_failed");
+    installDiagnosticHook(
+        endSceneTarget, reinterpret_cast<void*>(&HookAppLocalEndScene),
+        reinterpret_cast<void**>(&g_appLocalEndScene),
+        "app_local_end_scene_probe_failed");
+    installDiagnosticHook(
+        drawPrimitiveTarget,
+        reinterpret_cast<void*>(&HookAppLocalDrawPrimitive),
+        reinterpret_cast<void**>(&g_appLocalDrawPrimitive),
+        "app_local_draw_primitive_probe_failed");
+    installDiagnosticHook(
+        drawIndexedPrimitiveTarget,
+        reinterpret_cast<void*>(&HookAppLocalDrawIndexedPrimitive),
+        reinterpret_cast<void**>(&g_appLocalDrawIndexedPrimitive),
+        "app_local_draw_indexed_probe_failed");
+    installDiagnosticHook(
+        drawPrimitiveUpTarget,
+        reinterpret_cast<void*>(&HookAppLocalDrawPrimitiveUp),
+        reinterpret_cast<void**>(&g_appLocalDrawPrimitiveUp),
+        "app_local_draw_primitive_up_probe_failed");
+    installDiagnosticHook(
+        drawIndexedPrimitiveUpTarget,
+        reinterpret_cast<void*>(&HookAppLocalDrawIndexedPrimitiveUp),
+        reinterpret_cast<void**>(&g_appLocalDrawIndexedPrimitiveUp),
+        "app_local_draw_indexed_up_probe_failed");
+    installDiagnosticHook(
+        setIndicesTarget,
+        reinterpret_cast<void*>(&HookAppLocalSetIndices),
+        reinterpret_cast<void**>(&g_appLocalSetIndices),
+        "app_local_set_indices_probe_failed");
+    installDiagnosticHook(
+        setRenderTargetTarget,
+        reinterpret_cast<void*>(&HookAppLocalSetRenderTarget),
+        reinterpret_cast<void**>(&g_appLocalSetRenderTarget),
+        "app_local_set_render_target_probe_failed");
+    installDiagnosticHook(
+        stretchRectTarget,
+        reinterpret_cast<void*>(&HookAppLocalStretchRect),
+        reinterpret_cast<void**>(&g_appLocalStretchRect),
+        "app_local_stretch_rect_probe_failed");
+
+    GetBridge().LogHookStatus(
+        "INFO", "app_local_present_detour",
+        "System D3D9 Reset and Present implementations are intercepted "
+        "inside the app-local proxy; cached engine calls are covered.");
+    return true;
+}
+
+void PatchSwapChain(IDirect3DSwapChain9* swapChain) noexcept {
+    if (swapChain == nullptr) {
         return;
     }
-    if (InterlockedCompareExchange(&g_lateHooksActive, FALSE, FALSE) !=
-        FALSE) {
-        return;
-    }
-    void** vtable = *reinterpret_cast<void***>(device);
+
+    void** vtable = *reinterpret_cast<void***>(swapChain);
+    bool patched = false;
     AcquireSRWLockExclusive(&g_hookLock);
-    for (const DeviceVtableRecord& record : g_deviceRecords) {
+    for (const SwapChainVtableRecord& record : g_swapChainRecords) {
         if (record.vtable == vtable) {
             ReleaseSRWLockExclusive(&g_hookLock);
             return;
         }
     }
+    for (SwapChainVtableRecord& record : g_swapChainRecords) {
+        if (record.vtable != nullptr) {
+            continue;
+        }
+        record.vtable = vtable;
+        record.present =
+            reinterpret_cast<SwapChainPresentFunction>(vtable[3]);
+        patched = ReplaceVtableEntry(
+            vtable, 3,
+            reinterpret_cast<void*>(&HookSwapChainPresent));
+        if (!patched) {
+            record = {};
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_hookLock);
+
+    if (patched &&
+        InterlockedCompareExchange(
+            &g_swapChainHookLogged, TRUE, FALSE) == FALSE) {
+        GetBridge().LogHookStatus(
+            "INFO", "swapchain_present_hooked",
+            "IDirect3DSwapChain9::Present capture is active.");
+    }
+}
+
+void PatchDevice(
+    IDirect3DDevice9* device, bool hasEx = false,
+    bool translateManagedResources = false) noexcept {
+    if (device == nullptr) {
+        return;
+    }
+    void** vtable = *reinterpret_cast<void***>(device);
+    const bool lateHooksActive =
+        InterlockedCompareExchange(
+            &g_lateHooksActive, FALSE, FALSE) != FALSE;
+    const bool implementationHooksActive =
+        lateHooksActive ||
+        InstallAppLocalImplementationHooks(
+            vtable[16], vtable[17], vtable[43], vtable[42], vtable[81],
+            vtable[82], vtable[83], vtable[84], vtable[104],
+            vtable[37], vtable[34]);
+    AcquireSRWLockExclusive(&g_hookLock);
+    DeviceVtableRecord* selected = nullptr;
     for (DeviceVtableRecord& record : g_deviceRecords) {
-        if (record.vtable == nullptr) {
-            record.vtable = vtable;
-            record.reset =
-                reinterpret_cast<ResetFunction>(vtable[16]);
-            record.present =
-                reinterpret_cast<PresentFunction>(vtable[17]);
-            ReplaceVtableEntry(vtable, 16,
-                               reinterpret_cast<void*>(&HookReset));
-            ReplaceVtableEntry(vtable, 17,
-                               reinterpret_cast<void*>(&HookPresent));
+        if (record.vtable == vtable) {
+            selected = &record;
             break;
         }
     }
+    if (selected == nullptr) {
+        for (DeviceVtableRecord& record : g_deviceRecords) {
+            if (record.vtable != nullptr) {
+                continue;
+            }
+            selected = &record;
+            selected->vtable = vtable;
+            selected->createAdditionalSwapChain =
+                reinterpret_cast<CreateAdditionalSwapChainFunction>(
+                    vtable[13]);
+            selected->getSwapChain =
+                reinterpret_cast<GetSwapChainFunction>(vtable[14]);
+            selected->reset = implementationHooksActive
+                ? (lateHooksActive ? g_lateReset : g_appLocalReset)
+                : reinterpret_cast<ResetFunction>(vtable[16]);
+            selected->present = implementationHooksActive
+                ? (lateHooksActive ? g_latePresent : g_appLocalPresent)
+                : reinterpret_cast<PresentFunction>(vtable[17]);
+            ReplaceVtableEntry(
+                vtable, 13,
+                reinterpret_cast<void*>(&HookCreateAdditionalSwapChain));
+            ReplaceVtableEntry(
+                vtable, 14, reinterpret_cast<void*>(&HookGetSwapChain));
+            if (!implementationHooksActive) {
+                ReplaceVtableEntry(
+                    vtable, 16,
+                    reinterpret_cast<void*>(&HookReset));
+                ReplaceVtableEntry(
+                    vtable, 17,
+                    reinterpret_cast<void*>(&HookPresent));
+            }
+            break;
+        }
+    }
+    if (selected != nullptr && translateManagedResources &&
+        selected->createTexture == nullptr) {
+        selected->createTexture =
+            reinterpret_cast<CreateTextureFunction>(vtable[23]);
+        selected->createVolumeTexture =
+            reinterpret_cast<CreateVolumeTextureFunction>(vtable[24]);
+        selected->createCubeTexture =
+            reinterpret_cast<CreateCubeTextureFunction>(vtable[25]);
+        selected->createVertexBuffer =
+            reinterpret_cast<CreateVertexBufferFunction>(vtable[26]);
+        selected->createIndexBuffer =
+            reinterpret_cast<CreateIndexBufferFunction>(vtable[27]);
+        ReplaceVtableEntry(
+            vtable, 23, reinterpret_cast<void*>(&HookCreateTexture));
+        ReplaceVtableEntry(
+            vtable, 24, reinterpret_cast<void*>(&HookCreateVolumeTexture));
+        ReplaceVtableEntry(
+            vtable, 25, reinterpret_cast<void*>(&HookCreateCubeTexture));
+        ReplaceVtableEntry(
+            vtable, 26, reinterpret_cast<void*>(&HookCreateVertexBuffer));
+        ReplaceVtableEntry(
+            vtable, 27, reinterpret_cast<void*>(&HookCreateIndexBuffer));
+    }
+    if (selected != nullptr && hasEx &&
+        selected->presentEx == nullptr) {
+        selected->presentEx =
+            reinterpret_cast<PresentExFunction>(vtable[121]);
+        selected->resetEx =
+            reinterpret_cast<ResetExFunction>(vtable[132]);
+        ReplaceVtableEntry(
+            vtable, 121, reinterpret_cast<void*>(&HookPresentEx));
+        ReplaceVtableEntry(
+            vtable, 132, reinterpret_cast<void*>(&HookResetEx));
+    }
+    const GetSwapChainFunction getSwapChain =
+        selected == nullptr ? nullptr : selected->getSwapChain;
     ReleaseSRWLockExclusive(&g_hookLock);
+
+    IDirect3DSwapChain9* defaultSwapChain = nullptr;
+    if (getSwapChain != nullptr &&
+        SUCCEEDED(getSwapChain(device, 0, &defaultSwapChain)) &&
+        defaultSwapChain != nullptr) {
+        PatchSwapChain(defaultSwapChain);
+        defaultSwapChain->Release();
+    }
 }
 
 void PatchD3D9(IDirect3D9* direct3D, bool hasEx) noexcept {
@@ -2730,6 +3828,172 @@ DeviceVtableRecord FindDeviceRecord(void** vtable) noexcept {
     return result;
 }
 
+SwapChainVtableRecord FindSwapChainRecord(void** vtable) noexcept {
+    SwapChainVtableRecord result;
+    AcquireSRWLockShared(&g_hookLock);
+    for (const SwapChainVtableRecord& record : g_swapChainRecords) {
+        if (record.vtable == vtable) {
+            result = record;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_hookLock);
+    return result;
+}
+
+void LogPresentHookHresult(
+    const char* event, HRESULT result, const char* path) noexcept {
+    std::ostringstream message;
+    message << "path=" << (path == nullptr ? "unknown" : path)
+            << " HRESULT=0x" << std::hex << std::uppercase
+            << static_cast<std::uint32_t>(result);
+    GetBridge().LogHookStatus("ERROR", event, message.str());
+}
+
+void CaptureSwapChainBeforePresent(
+    IDirect3DSwapChain9* swapChain, HWND destinationWindow,
+    const char* path) noexcept {
+    if (swapChain == nullptr) {
+        return;
+    }
+    ComPtr<IDirect3DDevice9> device;
+    HRESULT result = swapChain->GetDevice(device.GetAddressOf());
+    if (FAILED(result) || !device) {
+        LogPresentHookHresult(
+            "present_swapchain_get_device_failed", result, path);
+        return;
+    }
+    ComPtr<IDirect3DSurface9> backBuffer;
+    result = swapChain->GetBackBuffer(
+        0, D3DBACKBUFFER_TYPE_MONO, backBuffer.GetAddressOf());
+    if (FAILED(result) || !backBuffer) {
+        LogPresentHookHresult(
+            "present_swapchain_get_backbuffer_failed", result, path);
+        return;
+    }
+    GetBridge().CapturePresent(
+        device.Get(), backBuffer.Get(), swapChain, destinationWindow,
+        path);
+}
+
+void CaptureDeviceBeforePresent(
+    IDirect3DDevice9* device, HWND destinationWindow,
+    const char* path) noexcept {
+    if (device == nullptr) {
+        return;
+    }
+    ComPtr<IDirect3DSwapChain9> swapChain;
+    const HRESULT result =
+        device->GetSwapChain(0, swapChain.GetAddressOf());
+    if (FAILED(result) || !swapChain) {
+        LogPresentHookHresult(
+            "present_device_get_swapchain_failed", result, path);
+        return;
+    }
+    CaptureSwapChainBeforePresent(
+        swapChain.Get(), destinationWindow, path);
+}
+
+void CaptureDeviceSurfaceBeforePresent(
+    IDirect3DDevice9* device, IDirect3DSurface9* sourceSurface,
+    HWND destinationWindow, const char* path) noexcept {
+    if (device == nullptr || sourceSurface == nullptr) {
+        return;
+    }
+    ComPtr<IDirect3DSwapChain9> swapChain;
+    const HRESULT result =
+        device->GetSwapChain(0, swapChain.GetAddressOf());
+    if (FAILED(result) || !swapChain) {
+        LogPresentHookHresult(
+            "present_device_get_swapchain_failed", result, path);
+        return;
+    }
+    GetBridge().CapturePresent(
+        device, sourceSurface, swapChain.Get(), destinationWindow,
+        path);
+}
+
+bool GetBoundFullscreenTextureSurface(
+    IDirect3DDevice9* device,
+    IDirect3DSurface9** outputSurface) noexcept {
+    if (device == nullptr || outputSurface == nullptr) {
+        return false;
+    }
+    *outputSurface = nullptr;
+
+    ComPtr<IDirect3DBaseTexture9> baseTexture;
+    HRESULT result = device->GetTexture(
+        0, baseTexture.GetAddressOf());
+    if (FAILED(result) || !baseTexture ||
+        baseTexture->GetType() != D3DRTYPE_TEXTURE) {
+        return false;
+    }
+    ComPtr<IDirect3DTexture9> texture;
+    result = baseTexture.As(&texture);
+    if (FAILED(result) || !texture) {
+        return false;
+    }
+    ComPtr<IDirect3DSurface9> textureSurface;
+    result = texture->GetSurfaceLevel(
+        0, textureSurface.GetAddressOf());
+    if (FAILED(result) || !textureSurface) {
+        LogPresentHookHresult(
+            "fullscreen_texture_get_surface_failed",
+            result, "app_local_end_scene_after_draw");
+        return false;
+    }
+
+    D3DSURFACE_DESC textureDescription{};
+    const HRESULT textureDescriptionResult =
+        textureSurface->GetDesc(&textureDescription);
+    if (FAILED(textureDescriptionResult) ||
+        textureDescription.Width == 0 ||
+        textureDescription.Height == 0) {
+        return false;
+    }
+    if (InterlockedCompareExchange(
+            &g_fullscreenTextureDescriptionLogged,
+            TRUE, FALSE) == FALSE) {
+        std::ostringstream message;
+        message << "size=" << textureDescription.Width << 'x'
+                << textureDescription.Height
+                << " format="
+                << static_cast<unsigned>(textureDescription.Format)
+                << " msaa="
+                << static_cast<unsigned>(
+                       textureDescription.MultiSampleType);
+        GetBridge().LogHookStatus(
+            "INFO", "final_fullscreen_texture_desc",
+            message.str());
+    }
+    if (textureDescription.Width < 64 ||
+        textureDescription.Height < 64) {
+        return false;
+    }
+
+    *outputSurface = textureSurface.Detach();
+    return true;
+}
+
+bool GetLastFullscreenTextureSurface(
+    IDirect3DSurface9** outputSurface) noexcept {
+    if (outputSurface == nullptr) {
+        return false;
+    }
+    *outputSurface = nullptr;
+    auto* const surface =
+        static_cast<IDirect3DSurface9*>(
+            InterlockedCompareExchangePointer(
+                &g_lastFullscreenTextureSurface,
+                nullptr, nullptr));
+    if (surface == nullptr) {
+        return false;
+    }
+    surface->AddRef();
+    *outputSurface = surface;
+    return true;
+}
+
 HRESULT STDMETHODCALLTYPE HookCreateDevice(
     IDirect3D9* self, UINT adapter, D3DDEVTYPE deviceType,
     HWND focusWindow, DWORD behaviorFlags,
@@ -2745,7 +4009,7 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(
         self, adapter, deviceType, focusWindow, behaviorFlags, parameters,
         output);
     if (SUCCEEDED(result) && output != nullptr) {
-        PatchDevice(*output);
+        PatchDevice(*output, false, false);
     }
     return result;
 }
@@ -2766,7 +4030,633 @@ HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(
         self, adapter, deviceType, focusWindow, behaviorFlags, parameters,
         fullscreenMode, output);
     if (SUCCEEDED(result) && output != nullptr) {
-        PatchDevice(*output);
+        PatchDevice(
+            *output, true, D3D9ExCompatibilityRequested());
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateAdditionalSwapChain(
+    IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters,
+    IDirect3DSwapChain9** output) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createAdditionalSwapChain == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result =
+        record.createAdditionalSwapChain(self, parameters, output);
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr) {
+        PatchSwapChain(*output);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookGetSwapChain(
+    IDirect3DDevice9* self, UINT index, IDirect3DSwapChain9** output) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.getSwapChain == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result = record.getSwapChain(self, index, output);
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr) {
+        PatchSwapChain(*output);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookSwapChainPresent(
+    IDirect3DSwapChain9* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion, DWORD flags) {
+    const SwapChainVtableRecord record =
+        FindSwapChainRecord(*reinterpret_cast<void***>(self));
+    if (record.present == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    CaptureSwapChainBeforePresent(
+        self, overrideWindow, "swapchain_present");
+    return record.present(
+        self, source, destination, overrideWindow, dirtyRegion, flags);
+}
+
+bool TranslateManagedResource(
+    DWORD& usage, D3DPOOL& pool,
+    bool requiresDynamicLocking) noexcept {
+    if (pool != D3DPOOL_MANAGED) {
+        return false;
+    }
+    pool = D3DPOOL_DEFAULT;
+    if (requiresDynamicLocking) {
+        usage |= D3DUSAGE_DYNAMIC;
+    }
+    if (InterlockedCompareExchange(
+            &g_managedResourceTranslationLogged, TRUE, FALSE) == FALSE) {
+        GetBridge().LogHookStatus(
+            "INFO", "d3d9ex_managed_translation",
+            "D3DPOOL_MANAGED resources use persistent D3D9Ex "
+            "allocations; textures remain dynamically lockable while "
+            "static vertex/index buffers retain their original usage.");
+    }
+    return true;
+}
+
+// D3D9Ex rejects D3DPOOL_MANAGED, but Jupiter EX queries the descriptor of
+// its persistent UI index buffer and relies on the pool identity it requested.
+// Keep the real allocation in D3DPOOL_DEFAULT while presenting the classic
+// descriptor to the game. The device hook unwraps this private interface
+// before forwarding SetIndices to the D3D9Ex runtime.
+constexpr GUID kManagedIndexBufferInner = {
+    0xc102956e, 0xe31a, 0x4adc,
+    {0x89, 0xbb, 0x4f, 0x7d, 0x59, 0xe4, 0x63, 0x2a}};
+
+class ManagedIndexBufferCompat;
+SRWLOCK g_managedIndexRegistryLock = SRWLOCK_INIT;
+std::array<ManagedIndexBufferCompat*, 64>
+    g_managedIndexBuffers{};
+volatile LONG g_nextManagedIndexDebugId = 0;
+
+class ManagedIndexBufferCompat final : public IDirect3DIndexBuffer9 {
+public:
+    ManagedIndexBufferCompat(
+        IDirect3DIndexBuffer9* inner,
+        DWORD requestedUsage, D3DFORMAT format,
+        UINT length) noexcept
+        : inner_(inner),
+          debugId_(InterlockedIncrement(
+              &g_nextManagedIndexDebugId)) {
+        description_.Format = format;
+        description_.Type = D3DRTYPE_INDEXBUFFER;
+        description_.Usage = requestedUsage;
+        description_.Pool = D3DPOOL_MANAGED;
+        description_.Size = length;
+        shadow_.resize(length);
+        bool registered = false;
+        AcquireSRWLockExclusive(&g_managedIndexRegistryLock);
+        for (auto& buffer : g_managedIndexBuffers) {
+            if (buffer == nullptr) {
+                buffer = this;
+                registered = true;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_managedIndexRegistryLock);
+        std::ostringstream message;
+        message << "id=" << debugId_
+                << " wrapper=0x" << std::hex
+                << reinterpret_cast<std::uintptr_t>(this)
+                << " inner=0x"
+                << reinterpret_cast<std::uintptr_t>(inner_)
+                << std::dec << " length=" << length
+                << " registered=" << (registered ? 1 : 0);
+        GetBridge().LogHookStatus(
+            registered ? "INFO" : "ERROR",
+            "d3d9ex_managed_index_lifecycle_create",
+            message.str());
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+        REFIID interfaceId, void** output) override {
+        if (output == nullptr) {
+            return E_POINTER;
+        }
+        *output = nullptr;
+        if (interfaceId == __uuidof(IUnknown) ||
+            interfaceId == __uuidof(IDirect3DResource9) ||
+            interfaceId == __uuidof(IDirect3DIndexBuffer9)) {
+            *output = static_cast<IDirect3DIndexBuffer9*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (interfaceId == kManagedIndexBufferInner) {
+            *output = inner_;
+            inner_->AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(
+            InterlockedIncrement(&references_));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG remaining = InterlockedDecrement(&references_);
+        if (remaining == 0) {
+            delete this;
+            return 0;
+        }
+        return static_cast<ULONG>(remaining);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDevice(
+        IDirect3DDevice9** device) override {
+        return inner_->GetDevice(device);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetPrivateData(
+        REFGUID guid, const void* data, DWORD size,
+        DWORD flags) override {
+        return inner_->SetPrivateData(guid, data, size, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPrivateData(
+        REFGUID guid, void* data, DWORD* size) override {
+        return inner_->GetPrivateData(guid, data, size);
+    }
+
+    HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID guid) override {
+        return inner_->FreePrivateData(guid);
+    }
+
+    DWORD STDMETHODCALLTYPE SetPriority(DWORD priority) override {
+        return inner_->SetPriority(priority);
+    }
+
+    DWORD STDMETHODCALLTYPE GetPriority() override {
+        return inner_->GetPriority();
+    }
+
+    void STDMETHODCALLTYPE PreLoad() override {
+        inner_->PreLoad();
+    }
+
+    D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override {
+        return D3DRTYPE_INDEXBUFFER;
+    }
+
+    HRESULT STDMETHODCALLTYPE Lock(
+        UINT offset, UINT size, void** data, DWORD flags) override {
+        // If the application never delivered the Unlock that belonged to a
+        // pre-reset Lock, do not let the stale suppression consume a future,
+        // unrelated Unlock.
+        suppressNextUnlock_ = false;
+        const HRESULT result =
+            inner_->Lock(offset, size, data, flags);
+        if (SUCCEEDED(result) && data != nullptr &&
+            *data != nullptr && offset <= shadow_.size()) {
+            lockedOffset_ = offset;
+            lockedSize_ = size != 0
+                ? (std::min)(
+                    static_cast<std::size_t>(size),
+                    shadow_.size() - offset)
+                : shadow_.size() - offset;
+            lockedData_ = *data;
+            if (InterlockedCompareExchange(
+                    &g_managedIndexLockLogged,
+                    TRUE, FALSE) == FALSE) {
+                std::ostringstream message;
+                message << "offset=" << offset
+                        << " size=" << size
+                        << " flags=0x" << std::hex << flags
+                        << std::dec << " data=1";
+                GetBridge().LogHookStatus(
+                    "INFO", "d3d9ex_managed_index_lock",
+                    message.str());
+            }
+        } else {
+            lockedData_ = nullptr;
+            lockedOffset_ = 0;
+            lockedSize_ = 0;
+        }
+        if (InterlockedIncrement(&lockLogCount_) <= 8) {
+            std::ostringstream message;
+            message << "id=" << debugId_
+                    << " offset=" << offset
+                    << " size=" << size
+                    << " flags=0x" << std::hex << flags
+                    << " HRESULT=0x"
+                    << static_cast<std::uint32_t>(result)
+                    << std::dec << " data="
+                    << (data != nullptr && *data != nullptr ? 1 : 0);
+            GetBridge().LogHookStatus(
+                SUCCEEDED(result) ? "INFO" : "ERROR",
+                "d3d9ex_managed_index_lifecycle_lock",
+                message.str());
+        }
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE Unlock() override {
+        if (suppressNextUnlock_) {
+            suppressNextUnlock_ = false;
+            LogUnlockLifecycle(D3D_OK, true);
+            return D3D_OK;
+        }
+        if (lockedData_ != nullptr && lockedSize_ != 0) {
+            std::memcpy(
+                shadow_.data() + lockedOffset_,
+                lockedData_, lockedSize_);
+            shadowReady_ = true;
+        }
+        lockedData_ = nullptr;
+        lockedOffset_ = 0;
+        lockedSize_ = 0;
+        const HRESULT result = inner_->Unlock();
+        LogUnlockLifecycle(result, false);
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc(
+        D3DINDEXBUFFER_DESC* description) override {
+        if (description == nullptr) {
+            return D3DERR_INVALIDCALL;
+        }
+        *description = description_;
+        return D3D_OK;
+    }
+
+    HRESULT RestoreAfterReset() noexcept {
+        if (!shadowReady_ || shadow_.empty()) {
+            return S_FALSE;
+        }
+        void* destination = nullptr;
+        HRESULT result = inner_->Lock(
+            0, static_cast<UINT>(shadow_.size()),
+            &destination, 0);
+        if (FAILED(result) || destination == nullptr) {
+            return FAILED(result) ? result : E_POINTER;
+        }
+        std::memcpy(
+            destination, shadow_.data(), shadow_.size());
+        result = inner_->Unlock();
+        return result;
+    }
+
+    HRESULT PrepareForReset() noexcept {
+        if (lockedData_ == nullptr) {
+            return S_FALSE;
+        }
+        if (lockedSize_ != 0) {
+            std::memcpy(
+                shadow_.data() + lockedOffset_,
+                lockedData_, lockedSize_);
+            shadowReady_ = true;
+        }
+        lockedData_ = nullptr;
+        lockedOffset_ = 0;
+        lockedSize_ = 0;
+        const HRESULT result = inner_->Unlock();
+        if (SUCCEEDED(result)) {
+            suppressNextUnlock_ = true;
+        }
+        return result;
+    }
+
+    LONG DebugId() const noexcept {
+        return debugId_;
+    }
+
+    bool IsLocked() const noexcept {
+        return lockedData_ != nullptr;
+    }
+
+    bool HasShadow() const noexcept {
+        return shadowReady_;
+    }
+
+    bool MarkSetIndicesLogged() noexcept {
+        return InterlockedCompareExchange(
+            &setIndicesLogged_, TRUE, FALSE) == FALSE;
+    }
+
+private:
+    void LogUnlockLifecycle(
+        HRESULT result, bool suppressed) noexcept {
+        if (InterlockedIncrement(&unlockLogCount_) > 8) {
+            return;
+        }
+        std::ostringstream message;
+        message << "id=" << debugId_
+                << " HRESULT=0x" << std::hex
+                << static_cast<std::uint32_t>(result)
+                << std::dec << " shadow_ready="
+                << (shadowReady_ ? 1 : 0)
+                << " suppressed=" << (suppressed ? 1 : 0);
+        GetBridge().LogHookStatus(
+            SUCCEEDED(result) ? "INFO" : "ERROR",
+            "d3d9ex_managed_index_lifecycle_unlock",
+            message.str());
+    }
+
+    ~ManagedIndexBufferCompat() {
+        InterlockedCompareExchangePointer(
+            &g_managedIndexBuffer, nullptr, this);
+        AcquireSRWLockExclusive(&g_managedIndexRegistryLock);
+        for (auto& buffer : g_managedIndexBuffers) {
+            if (buffer == this) {
+                buffer = nullptr;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_managedIndexRegistryLock);
+        inner_->Release();
+    }
+
+    volatile LONG references_{1};
+    IDirect3DIndexBuffer9* inner_{nullptr};
+    LONG debugId_{0};
+    D3DINDEXBUFFER_DESC description_{};
+    std::vector<std::uint8_t> shadow_;
+    void* lockedData_{nullptr};
+    std::size_t lockedOffset_{0};
+    std::size_t lockedSize_{0};
+    bool shadowReady_{false};
+    bool suppressNextUnlock_{false};
+    volatile LONG lockLogCount_{0};
+    volatile LONG unlockLogCount_{0};
+    volatile LONG setIndicesLogged_{FALSE};
+};
+
+void PrepareManagedIndexBuffersForReset() noexcept {
+    std::array<ManagedIndexBufferCompat*, 64> buffers{};
+    AcquireSRWLockShared(&g_managedIndexRegistryLock);
+    for (std::size_t index = 0;
+         index < g_managedIndexBuffers.size(); ++index) {
+        buffers[index] = g_managedIndexBuffers[index];
+        if (buffers[index] != nullptr) {
+            buffers[index]->AddRef();
+        }
+    }
+    ReleaseSRWLockShared(&g_managedIndexRegistryLock);
+
+    UINT prepared = 0;
+    UINT registered = 0;
+    UINT locked = 0;
+    UINT shadowed = 0;
+    HRESULT failure = S_OK;
+    for (ManagedIndexBufferCompat* buffer : buffers) {
+        if (buffer == nullptr) {
+            continue;
+        }
+        ++registered;
+        locked += buffer->IsLocked() ? 1U : 0U;
+        shadowed += buffer->HasShadow() ? 1U : 0U;
+        const HRESULT result = buffer->PrepareForReset();
+        if (result == S_OK) {
+            ++prepared;
+        } else if (FAILED(result) && SUCCEEDED(failure)) {
+            failure = result;
+        }
+        buffer->Release();
+    }
+    std::ostringstream message;
+    message << "registered=" << registered
+            << " locked=" << locked
+            << " shadowed=" << shadowed
+            << " prepared=" << prepared << " HRESULT=0x"
+            << std::hex << std::uppercase
+            << static_cast<std::uint32_t>(failure);
+    GetBridge().LogHookStatus(
+        FAILED(failure) ? "ERROR" : "INFO",
+        "d3d9ex_managed_prepare_reset", message.str());
+}
+
+void RestoreManagedIndexBuffersAfterReset() noexcept {
+    std::array<ManagedIndexBufferCompat*, 64> buffers{};
+    AcquireSRWLockShared(&g_managedIndexRegistryLock);
+    for (std::size_t index = 0;
+         index < g_managedIndexBuffers.size(); ++index) {
+        buffers[index] = g_managedIndexBuffers[index];
+        if (buffers[index] != nullptr) {
+            buffers[index]->AddRef();
+        }
+    }
+    ReleaseSRWLockShared(&g_managedIndexRegistryLock);
+
+    UINT restored = 0;
+    UINT registered = 0;
+    UINT shadowed = 0;
+    HRESULT failure = S_OK;
+    for (ManagedIndexBufferCompat* buffer : buffers) {
+        if (buffer == nullptr) {
+            continue;
+        }
+        ++registered;
+        shadowed += buffer->HasShadow() ? 1U : 0U;
+        const HRESULT result = buffer->RestoreAfterReset();
+        if (result == S_OK) {
+            ++restored;
+        } else if (FAILED(result) && SUCCEEDED(failure)) {
+            failure = result;
+        }
+        buffer->Release();
+    }
+    std::ostringstream message;
+    message << "registered=" << registered
+            << " shadowed=" << shadowed
+            << " restored=" << restored << " HRESULT=0x"
+            << std::hex << std::uppercase
+            << static_cast<std::uint32_t>(failure);
+    GetBridge().LogHookStatus(
+        FAILED(failure) ? "ERROR" : "INFO",
+        "d3d9ex_managed_restore", message.str());
+}
+
+void LogManagedResourceResult(
+    std::size_t kindIndex, const char* kind, HRESULT result) noexcept {
+    if (FAILED(result)) {
+        std::ostringstream message;
+        message << "kind=" << kind << " HRESULT=0x"
+                << std::hex << std::uppercase
+                << static_cast<std::uint32_t>(result);
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9ex_managed_create_failed", message.str());
+        return;
+    }
+    if (kindIndex < 5 &&
+        InterlockedCompareExchange(
+            &g_managedResourceSuccessLogged[kindIndex],
+            TRUE, FALSE) == FALSE) {
+        GetBridge().LogHookStatus(
+            "INFO", "d3d9ex_managed_create",
+            std::string("kind=") + kind + " HRESULT=0x00000000");
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateTexture(
+    IDirect3DDevice9* self, UINT width, UINT height, UINT levels,
+    DWORD usage, D3DFORMAT format, D3DPOOL pool,
+    IDirect3DTexture9** output, HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createTexture == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const bool translated =
+        TranslateManagedResource(usage, pool, true);
+    const HRESULT result = record.createTexture(
+        self, width, height, levels, usage, format, pool, output,
+        sharedHandle);
+    if (translated) {
+        LogManagedResourceResult(0, "texture", result);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateVolumeTexture(
+    IDirect3DDevice9* self, UINT width, UINT height, UINT depth,
+    UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+    IDirect3DVolumeTexture9** output, HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createVolumeTexture == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const bool translated =
+        TranslateManagedResource(usage, pool, true);
+    const HRESULT result = record.createVolumeTexture(
+        self, width, height, depth, levels, usage, format, pool,
+        output, sharedHandle);
+    if (translated) {
+        LogManagedResourceResult(1, "volume_texture", result);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateCubeTexture(
+    IDirect3DDevice9* self, UINT edgeLength, UINT levels, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture9** output,
+    HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createCubeTexture == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const bool translated =
+        TranslateManagedResource(usage, pool, true);
+    const HRESULT result = record.createCubeTexture(
+        self, edgeLength, levels, usage, format, pool, output,
+        sharedHandle);
+    if (translated) {
+        LogManagedResourceResult(2, "cube_texture", result);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateVertexBuffer(
+    IDirect3DDevice9* self, UINT length, DWORD usage, DWORD fvf,
+    D3DPOOL pool, IDirect3DVertexBuffer9** output,
+    HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createVertexBuffer == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const bool translated =
+        TranslateManagedResource(usage, pool, false);
+    const HRESULT result = record.createVertexBuffer(
+        self, length, usage, fvf, pool, output, sharedHandle);
+    if (translated) {
+        LogManagedResourceResult(3, "vertex_buffer", result);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateIndexBuffer(
+    IDirect3DDevice9* self, UINT length, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DIndexBuffer9** output,
+    HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createIndexBuffer == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const DWORD requestedUsage = usage;
+    const D3DPOOL requestedPool = pool;
+    const bool translated =
+        TranslateManagedResource(usage, pool, false);
+    IDirect3DIndexBuffer9* inner = nullptr;
+    HRESULT result = record.createIndexBuffer(
+        self, length, usage, format, pool, &inner, sharedHandle);
+    if (translated && SUCCEEDED(result) && inner != nullptr) {
+        auto* compatibility = new (std::nothrow)
+            ManagedIndexBufferCompat(
+                inner, requestedUsage, format, length);
+        if (compatibility == nullptr) {
+            inner->Release();
+            result = E_OUTOFMEMORY;
+        } else if (output == nullptr) {
+            compatibility->Release();
+            result = D3DERR_INVALIDCALL;
+        } else {
+            *output = compatibility;
+        }
+    } else if (output != nullptr) {
+        *output = inner;
+    } else if (inner != nullptr) {
+        inner->Release();
+        result = D3DERR_INVALIDCALL;
+    }
+    if (translated) {
+        LogManagedResourceResult(4, "index_buffer", result);
+        if (InterlockedCompareExchange(
+                &g_managedIndexCreateDetailsLogged,
+                TRUE, FALSE) == FALSE) {
+            std::ostringstream message;
+            message << "length=" << length
+                    << " requested_usage=0x" << std::hex
+                    << requestedUsage
+                    << " effective_usage=0x" << usage << std::dec
+                    << " requested_pool="
+                    << static_cast<unsigned>(requestedPool)
+                    << " effective_pool="
+                    << static_cast<unsigned>(pool)
+                    << " format=" << static_cast<unsigned>(format)
+                    << " HRESULT=0x" << std::hex << std::uppercase
+                    << static_cast<std::uint32_t>(result);
+            GetBridge().LogHookStatus(
+                SUCCEEDED(result) ? "INFO" : "ERROR",
+                "d3d9ex_managed_index_create_details",
+                message.str());
+        }
+        if (SUCCEEDED(result) && output != nullptr &&
+            *output != nullptr) {
+            InterlockedExchangePointer(
+                &g_managedIndexBuffer, *output);
+        }
     }
     return result;
 }
@@ -2778,9 +4668,24 @@ HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* self,
     if (record.reset == nullptr) {
         return D3DERR_INVALIDCALL;
     }
+    if (D3D9ExCompatibilityRequested() &&
+        !D3D9ExExclusiveRequested() && parameters != nullptr) {
+        D3DDEVICE_CREATION_PARAMETERS creation{};
+        HWND focusWindow = nullptr;
+        if (SUCCEEDED(self->GetCreationParameters(&creation))) {
+            focusWindow = creation.hFocusWindow;
+        }
+        TranslateD3D9ExPresentation(focusWindow, parameters);
+    }
     ForceHighQualitySource(parameters);
+    if (D3D9ExCompatibilityRequested()) {
+        PrepareManagedIndexBuffersForReset();
+    }
     GetBridge().BeforeReset();
     const HRESULT result = record.reset(self, parameters);
+    if (SUCCEEDED(result) && D3D9ExCompatibilityRequested()) {
+        RestoreManagedIndexBuffersAfterReset();
+    }
     GetBridge().AfterReset(result);
     return result;
 }
@@ -2795,15 +4700,871 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* self,
     if (record.present == nullptr) {
         return D3DERR_INVALIDCALL;
     }
-    GetBridge().CapturePresent(self);
+    CaptureDeviceBeforePresent(
+        self, overrideWindow, "device_present");
     return record.present(self, source, destination, overrideWindow,
                           dirtyRegion);
+}
+
+HRESULT STDMETHODCALLTYPE HookResetEx(
+    IDirect3DDevice9Ex* self, D3DPRESENT_PARAMETERS* parameters,
+    D3DDISPLAYMODEEX* fullscreenMode) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.resetEx == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    bool translated = false;
+    if (D3D9ExCompatibilityRequested() &&
+        !D3D9ExExclusiveRequested() && parameters != nullptr) {
+        D3DDEVICE_CREATION_PARAMETERS creation{};
+        HWND focusWindow = nullptr;
+        if (SUCCEEDED(self->GetCreationParameters(&creation))) {
+            focusWindow = creation.hFocusWindow;
+        }
+        translated =
+            TranslateD3D9ExPresentation(focusWindow, parameters);
+    }
+    if (translated) {
+        fullscreenMode = nullptr;
+    }
+    ForceHighQualitySource(parameters);
+    if (D3D9ExCompatibilityRequested()) {
+        PrepareManagedIndexBuffersForReset();
+    }
+    GetBridge().BeforeReset();
+    const HRESULT result =
+        record.resetEx(self, parameters, fullscreenMode);
+    if (SUCCEEDED(result) && D3D9ExCompatibilityRequested()) {
+        RestoreManagedIndexBuffersAfterReset();
+    }
+    GetBridge().AfterReset(result);
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookPresentEx(
+    IDirect3DDevice9Ex* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion, DWORD flags) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.presentEx == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    CaptureDeviceBeforePresent(
+        self, overrideWindow, "device_present_ex");
+    return record.presentEx(
+        self, source, destination, overrideWindow, dirtyRegion, flags);
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalReset(
+    IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters) {
+    if (g_appLocalReset == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (D3D9ExCompatibilityRequested() &&
+        !D3D9ExExclusiveRequested() && parameters != nullptr) {
+        D3DDEVICE_CREATION_PARAMETERS creation{};
+        HWND focusWindow = nullptr;
+        if (SUCCEEDED(self->GetCreationParameters(&creation))) {
+            focusWindow = creation.hFocusWindow;
+        }
+        TranslateD3D9ExPresentation(focusWindow, parameters);
+    }
+    ForceHighQualitySource(parameters);
+    if (D3D9ExCompatibilityRequested()) {
+        PrepareManagedIndexBuffersForReset();
+    }
+    GetBridge().BeforeReset();
+
+    HRESULT result = D3DERR_INVALIDCALL;
+    ComPtr<IDirect3DDevice9Ex> deviceEx;
+    if (D3D9ExCompatibilityRequested() &&
+        record.resetEx != nullptr &&
+        SUCCEEDED(self->QueryInterface(
+            __uuidof(IDirect3DDevice9Ex),
+            reinterpret_cast<void**>(deviceEx.GetAddressOf()))) &&
+        deviceEx) {
+        D3DDISPLAYMODEEX displayMode{};
+        D3DDISPLAYMODEEX* displayModePointer = nullptr;
+        if (D3D9ExExclusiveRequested() && parameters != nullptr &&
+            !parameters->Windowed) {
+            displayMode.Size = sizeof(displayMode);
+            if (FAILED(deviceEx->GetDisplayModeEx(
+                    0, &displayMode, nullptr))) {
+                displayMode.Width = parameters->BackBufferWidth;
+                displayMode.Height = parameters->BackBufferHeight;
+                displayMode.RefreshRate =
+                    parameters->FullScreen_RefreshRateInHz;
+                displayMode.Format = parameters->BackBufferFormat;
+                displayMode.ScanLineOrdering =
+                    D3DSCANLINEORDERING_PROGRESSIVE;
+            } else {
+                if (parameters->BackBufferWidth != 0) {
+                    displayMode.Width =
+                        parameters->BackBufferWidth;
+                }
+                if (parameters->BackBufferHeight != 0) {
+                    displayMode.Height =
+                        parameters->BackBufferHeight;
+                }
+                if (parameters->BackBufferFormat != D3DFMT_UNKNOWN) {
+                    displayMode.Format =
+                        parameters->BackBufferFormat;
+                }
+                if (parameters->FullScreen_RefreshRateInHz != 0) {
+                    displayMode.RefreshRate =
+                        parameters->FullScreen_RefreshRateInHz;
+                }
+            }
+            parameters->FullScreen_RefreshRateInHz =
+                displayMode.RefreshRate;
+            displayModePointer = &displayMode;
+        }
+        result = record.resetEx(
+            deviceEx.Get(), parameters, displayModePointer);
+        GetBridge().LogHookStatus(
+            SUCCEEDED(result) ? "INFO" : "ERROR",
+            "d3d9ex_reset_redirected",
+            SUCCEEDED(result)
+                ? "Classic Reset completed through ResetEx."
+                : "Classic Reset redirected to ResetEx but failed.");
+    } else {
+        result = g_appLocalReset(self, parameters);
+    }
+    if (SUCCEEDED(result) && D3D9ExCompatibilityRequested()) {
+        RestoreManagedIndexBuffersAfterReset();
+    }
+    GetBridge().AfterReset(result);
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalPresent(
+    IDirect3DDevice9* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion) {
+    if (g_appLocalPresent == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const LONG drawSequence = InterlockedCompareExchange(
+        &g_lastDrawSequence, 0, 0);
+    if (drawSequence != 0 &&
+        InterlockedCompareExchange(
+            &g_presentOrderLogged, TRUE, FALSE) == FALSE) {
+        const LONG clearSequence = InterlockedCompareExchange(
+            &g_lastClearSequence, 0, 0);
+        const LONG endSceneSequence = InterlockedCompareExchange(
+            &g_lastEndSceneSequence, 0, 0);
+        void* const drawDevice = InterlockedCompareExchangePointer(
+            &g_lastDrawDevice, nullptr, nullptr);
+        std::ostringstream message;
+        message << "draw_sequence=" << drawSequence
+                << " clear_sequence=" << clearSequence
+                << " draw_after_clear="
+                << (drawSequence > clearSequence ? 1 : 0)
+                << " end_scene_sequence=" << endSceneSequence
+                << " end_scene_after_draw="
+                << (endSceneSequence > drawSequence ? 1 : 0)
+                << " end_scene_before_clear="
+                << (endSceneSequence > drawSequence &&
+                    endSceneSequence < clearSequence ? 1 : 0)
+                << " same_device="
+                << (drawDevice == self ? 1 : 0);
+        GetBridge().LogHookStatus(
+            "INFO", "d3d9_present_order", message.str());
+    }
+    const LONG endSceneCaptureDrawSequence =
+        InterlockedCompareExchange(
+            &g_lastEndSceneCaptureDrawSequence, 0, 0);
+    const LONG clearSequence = InterlockedCompareExchange(
+        &g_lastClearSequence, 0, 0);
+    const bool capturedBeforeDestructiveClear =
+        drawSequence != 0 &&
+        endSceneCaptureDrawSequence == drawSequence &&
+        clearSequence > drawSequence;
+    if (capturedBeforeDestructiveClear) {
+        if (InterlockedCompareExchange(
+                &g_presentCaptureSuppressedLogged,
+                TRUE, FALSE) == FALSE) {
+            GetBridge().LogHookStatus(
+                "INFO", "d3d9_present_capture_suppressed",
+                "The completed backbuffer was captured after EndScene "
+                "before Jupiter EX cleared it; the later black Present "
+                "is ignored.");
+        }
+    } else {
+        CaptureDeviceBeforePresent(
+            self, overrideWindow, "app_local_device_present");
+    }
+    return g_appLocalPresent(
+        self, source, destination, overrideWindow, dirtyRegion);
+}
+
+void LogRenderActivity(
+    volatile LONG* logged, const char* event, HRESULT result,
+    const std::string& details) noexcept {
+    if (InterlockedCompareExchange(logged, TRUE, FALSE) != FALSE) {
+        return;
+    }
+    std::ostringstream message;
+    message << details << " HRESULT=0x" << std::hex << std::uppercase
+            << static_cast<std::uint32_t>(result);
+    GetBridge().LogHookStatus(
+        SUCCEEDED(result) ? "INFO" : "ERROR", event, message.str());
+}
+
+void AppendDrawState(
+    IDirect3DDevice9* device, std::ostringstream& details) noexcept {
+    ComPtr<IDirect3DSurface9> target;
+    ComPtr<IDirect3DSurface9> backBuffer;
+    const HRESULT targetResult =
+        device->GetRenderTarget(0, target.GetAddressOf());
+    const HRESULT backBufferResult = device->GetBackBuffer(
+        0, 0, D3DBACKBUFFER_TYPE_MONO, backBuffer.GetAddressOf());
+    D3DSURFACE_DESC targetDescription{};
+    const HRESULT descriptionResult = target
+        ? target->GetDesc(&targetDescription)
+        : D3DERR_INVALIDCALL;
+
+    D3DVIEWPORT9 viewport{};
+    const HRESULT viewportResult = device->GetViewport(&viewport);
+    DWORD colorWrite = 0;
+    const HRESULT colorWriteResult =
+        device->GetRenderState(D3DRS_COLORWRITEENABLE, &colorWrite);
+
+    ComPtr<IDirect3DBaseTexture9> texture;
+    const HRESULT textureResult =
+        device->GetTexture(0, texture.GetAddressOf());
+    ComPtr<IDirect3DVertexShader9> vertexShader;
+    const HRESULT vertexShaderResult =
+        device->GetVertexShader(vertexShader.GetAddressOf());
+    ComPtr<IDirect3DPixelShader9> pixelShader;
+    const HRESULT pixelShaderResult =
+        device->GetPixelShader(pixelShader.GetAddressOf());
+
+    details << " target_hr=0x" << std::hex
+            << static_cast<std::uint32_t>(targetResult)
+            << " backbuffer_hr=0x"
+            << static_cast<std::uint32_t>(backBufferResult)
+            << " target_is_backbuffer="
+            << (target && backBuffer &&
+                target.Get() == backBuffer.Get() ? 1 : 0)
+            << " target_desc_hr=0x"
+            << static_cast<std::uint32_t>(descriptionResult)
+            << std::dec
+            << " target=" << targetDescription.Width << 'x'
+            << targetDescription.Height
+            << " format="
+            << static_cast<unsigned>(targetDescription.Format)
+            << " msaa="
+            << static_cast<unsigned>(
+                   targetDescription.MultiSampleType)
+            << " viewport_hr=0x" << std::hex
+            << static_cast<std::uint32_t>(viewportResult)
+            << std::dec
+            << " viewport=" << viewport.X << ',' << viewport.Y
+            << ',' << viewport.Width << 'x' << viewport.Height
+            << " colorwrite_hr=0x" << std::hex
+            << static_cast<std::uint32_t>(colorWriteResult)
+            << " colorwrite=0x" << colorWrite
+            << " texture_hr=0x"
+            << static_cast<std::uint32_t>(textureResult)
+            << " texture=" << (texture ? 1 : 0)
+            << " vs_hr=0x"
+            << static_cast<std::uint32_t>(vertexShaderResult)
+            << " vs=" << (vertexShader ? 1 : 0)
+            << " ps_hr=0x"
+            << static_cast<std::uint32_t>(pixelShaderResult)
+            << " ps=" << (pixelShader ? 1 : 0)
+            << std::dec;
+}
+
+bool GetSelectedEngineRenderTarget(
+    IDirect3DDevice9* device,
+    IDirect3DSurface9** outputSurface) noexcept {
+    if (device == nullptr || outputSurface == nullptr) {
+        return false;
+    }
+    *outputSurface = nullptr;
+    auto* const selected =
+        static_cast<IDirect3DSurface9*>(
+            InterlockedCompareExchangePointer(
+                &g_selectedEngineRenderTarget,
+                nullptr, nullptr));
+    if (selected == nullptr) {
+        return false;
+    }
+    ComPtr<IDirect3DDevice9> surfaceDevice;
+    if (FAILED(selected->GetDevice(
+            surfaceDevice.GetAddressOf())) ||
+        surfaceDevice.Get() != device) {
+        return false;
+    }
+    selected->AddRef();
+    *outputSurface = selected;
+    return true;
+}
+
+bool ProbeNextEngineRenderTarget(
+    IDirect3DDevice9* device,
+    IDirect3DSurface9** outputSurface) noexcept {
+    if (device == nullptr || outputSurface == nullptr) {
+        return false;
+    }
+    *outputSurface = nullptr;
+    const LONG cadence =
+        InterlockedIncrement(&g_engineSurfaceProbeCadence);
+    if (cadence != 1 && cadence % 10 != 0) {
+        return false;
+    }
+
+    const LONG targetCount = InterlockedCompareExchange(
+        &g_engineRenderTargetCount, 0, 0);
+    if (targetCount <= 0) {
+        return false;
+    }
+    const LONG cursor =
+        InterlockedIncrement(&g_engineSurfaceProbeCursor) - 1;
+    if (cursor >= targetCount * 4) {
+        return false;
+    }
+    const LONG targetIndex = cursor % targetCount;
+
+    ComPtr<IDirect3DSurface9> candidate;
+    LONG candidateId = 0;
+    AcquireSRWLockShared(&g_renderTargetTraceLock);
+    const TrackedRenderTarget& tracked =
+        g_engineRenderTargets[
+            static_cast<std::size_t>(targetIndex)];
+    if (tracked.device == device && tracked.surface != nullptr) {
+        tracked.surface->AddRef();
+        candidate.Attach(tracked.surface);
+        candidateId = tracked.id;
+    }
+    ReleaseSRWLockShared(&g_renderTargetTraceLock);
+    if (!candidate) {
+        return false;
+    }
+
+    ComPtr<IDirect3DSurface9> backBuffer;
+    D3DSURFACE_DESC candidateDescription{};
+    D3DSURFACE_DESC backBufferDescription{};
+    if (FAILED(device->GetBackBuffer(
+            0, 0, D3DBACKBUFFER_TYPE_MONO,
+            backBuffer.GetAddressOf())) ||
+        !backBuffer ||
+        FAILED(candidate->GetDesc(&candidateDescription)) ||
+        FAILED(backBuffer->GetDesc(&backBufferDescription)) ||
+        candidateDescription.Width != backBufferDescription.Width ||
+        candidateDescription.Height != backBufferDescription.Height ||
+        candidateDescription.Format != backBufferDescription.Format) {
+        return false;
+    }
+
+    const std::string probeName =
+        "tracked_render_target_" + std::to_string(candidateId);
+    if (!GetBridge().ProbeDiagnosticSurface(
+            device, candidate.Get(), probeName.c_str())) {
+        return false;
+    }
+
+    InterlockedExchangePointer(
+        &g_selectedEngineRenderTarget,
+        candidate.Get());
+    if (InterlockedCompareExchange(
+            &g_engineRenderTargetCaptureLogged,
+            TRUE, FALSE) == FALSE) {
+        GetBridge().LogHookStatus(
+            "WARN", "tracked_render_target_capture_selected",
+            "A tracked full-size engine render target contains RGB "
+            "pixels while the presentation backbuffer is black; "
+            "capture now follows that persistent surface.");
+    }
+    *outputSurface = candidate.Detach();
+    return true;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalClear(
+    IDirect3DDevice9* self, DWORD count, const D3DRECT* rectangles,
+    DWORD flags, D3DCOLOR color, float depth, DWORD stencil) {
+    if (g_appLocalClear == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result = g_appLocalClear(
+        self, count, rectangles, flags, color, depth, stencil);
+    const LONG sequence =
+        InterlockedIncrement(&g_renderActivitySequence);
+    InterlockedExchange(&g_lastClearSequence, sequence);
+    std::ostringstream details;
+    details << "flags=0x" << std::hex << std::uppercase << flags
+            << " color=0x" << color << std::dec
+            << " rectangles=" << count;
+    LogRenderActivity(
+        &g_clearLogged, "d3d9_clear_activity", result, details.str());
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalEndScene(IDirect3DDevice9* self) {
+    if (g_appLocalEndScene == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result = g_appLocalEndScene(self);
+    const LONG sequence =
+        InterlockedIncrement(&g_renderActivitySequence);
+    InterlockedExchange(&g_lastEndSceneSequence, sequence);
+    const LONG drawSequence = InterlockedCompareExchange(
+        &g_lastDrawSequence, 0, 0);
+    const LONG clearSequence = InterlockedCompareExchange(
+        &g_lastClearSequence, 0, 0);
+    void* const drawDevice = InterlockedCompareExchangePointer(
+        &g_lastDrawDevice, nullptr, nullptr);
+    std::ostringstream details;
+    details << "sequence=" << sequence
+            << " draw_sequence=" << drawSequence
+            << " clear_sequence=" << clearSequence
+            << " after_draw=" << (sequence > drawSequence ? 1 : 0)
+            << " draw_after_clear="
+            << (drawSequence > clearSequence ? 1 : 0)
+            << " same_device=" << (drawDevice == self ? 1 : 0);
+    LogRenderActivity(
+        &g_endSceneLogged, "d3d9_end_scene_activity",
+        result, details.str());
+    if (drawSequence != 0) {
+        LogRenderActivity(
+            &g_endSceneAfterDrawLogged,
+            "d3d9_end_scene_after_draw",
+            result, details.str());
+    }
+    const LONG capturedDrawSequence = InterlockedCompareExchange(
+        &g_lastEndSceneCaptureDrawSequence, 0, 0);
+    const bool completedDrawPass =
+        SUCCEEDED(result) &&
+        drawSequence > clearSequence &&
+        drawDevice == self &&
+        capturedDrawSequence != drawSequence;
+    if (completedDrawPass &&
+        !GetBridge().ShouldDeferEndSceneCapture() &&
+        !g_endSceneCaptureActive) {
+        g_endSceneCaptureActive = true;
+        ComPtr<IDirect3DSurface9> trackedRenderTarget;
+        bool useTrackedRenderTarget =
+            GetSelectedEngineRenderTarget(
+                self, trackedRenderTarget.GetAddressOf());
+        if (!useTrackedRenderTarget) {
+            useTrackedRenderTarget =
+                ProbeNextEngineRenderTarget(
+                    self, trackedRenderTarget.GetAddressOf());
+        }
+        ComPtr<IDirect3DSurface9> fullscreenTextureSurface;
+        const LONG fullscreenDrawSequence =
+            InterlockedCompareExchange(
+                &g_lastFullscreenDrawSequence, 0, 0);
+        const bool hasFullscreenTexture =
+            D3D9ExCompatibilityRequested() &&
+            fullscreenDrawSequence > clearSequence &&
+            fullscreenDrawSequence <= drawSequence &&
+            GetLastFullscreenTextureSurface(
+                fullscreenTextureSurface.GetAddressOf());
+        bool useFullscreenTexture =
+            hasFullscreenTexture &&
+            InterlockedCompareExchange(
+                &g_useFullscreenTextureCapture,
+                FALSE, FALSE) != FALSE;
+        if (hasFullscreenTexture && !useFullscreenTexture) {
+            const LONG probePass = InterlockedIncrement(
+                &g_fullscreenTextureProbePasses);
+            if (probePass == 1 || probePass % 60 == 0) {
+                useFullscreenTexture =
+                    GetBridge().ProbeDiagnosticSurface(
+                        self, fullscreenTextureSurface.Get(),
+                        "final_fullscreen_texture");
+                if (useFullscreenTexture) {
+                    InterlockedExchange(
+                        &g_useFullscreenTextureCapture, TRUE);
+                    if (InterlockedCompareExchange(
+                            &g_fullscreenTextureCaptureLogged,
+                            TRUE, FALSE) == FALSE) {
+                        GetBridge().LogHookStatus(
+                            "WARN",
+                            "fullscreen_texture_capture_selected",
+                            "The final fullscreen draw sampled a "
+                            "nonblack full-size texture while its "
+                            "backbuffer output stayed black; capture "
+                            "now follows that composite texture.");
+                    }
+                }
+            }
+        }
+        if (useTrackedRenderTarget) {
+            CaptureDeviceSurfaceBeforePresent(
+                self, trackedRenderTarget.Get(), nullptr,
+                "app_local_end_scene_tracked_render_target");
+        } else if (useFullscreenTexture) {
+            CaptureDeviceSurfaceBeforePresent(
+                self, fullscreenTextureSurface.Get(), nullptr,
+                "app_local_end_scene_fullscreen_texture");
+        } else {
+            CaptureDeviceBeforePresent(
+                self, nullptr,
+                "app_local_end_scene_after_draw");
+        }
+        g_endSceneCaptureActive = false;
+        InterlockedExchange(
+            &g_lastEndSceneCaptureDrawSequence, drawSequence);
+        LogRenderActivity(
+            &g_endSceneCaptureLogged,
+            "d3d9_end_scene_capture",
+            S_OK,
+            "Captured the completed backbuffer after EndScene so a later "
+            "Jupiter EX color clear cannot erase the mono frame.");
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalDrawPrimitive(
+    IDirect3DDevice9* self, D3DPRIMITIVETYPE primitiveType,
+    UINT startVertex, UINT primitiveCount) {
+    if (g_appLocalDrawPrimitive == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result = g_appLocalDrawPrimitive(
+        self, primitiveType, startVertex, primitiveCount);
+    const LONG sequence =
+        InterlockedIncrement(&g_renderActivitySequence);
+    InterlockedExchange(&g_lastDrawSequence, sequence);
+    InterlockedExchangePointer(
+        &g_lastDrawDevice, self);
+    if (SUCCEEDED(result) &&
+        primitiveType == D3DPT_TRIANGLESTRIP &&
+        primitiveCount == 2) {
+        ComPtr<IDirect3DSurface9> target;
+        D3DSURFACE_DESC description{};
+        D3DVIEWPORT9 viewport{};
+        ComPtr<IDirect3DBaseTexture9> texture;
+        if (SUCCEEDED(self->GetRenderTarget(
+                0, target.GetAddressOf())) &&
+            target &&
+            SUCCEEDED(target->GetDesc(&description)) &&
+            SUCCEEDED(self->GetViewport(&viewport)) &&
+            viewport.X == 0 && viewport.Y == 0 &&
+            viewport.Width == description.Width &&
+            viewport.Height == description.Height &&
+            SUCCEEDED(self->GetTexture(
+                0, texture.GetAddressOf())) &&
+            texture) {
+            InterlockedExchange(
+                &g_lastFullscreenDrawSequence, sequence);
+            ComPtr<IDirect3DSurface9> fullscreenTextureSurface;
+            if (GetBoundFullscreenTextureSurface(
+                    self,
+                    fullscreenTextureSurface.GetAddressOf())) {
+                auto* const previous =
+                    static_cast<IDirect3DSurface9*>(
+                        InterlockedExchangePointer(
+                            &g_lastFullscreenTextureSurface,
+                            fullscreenTextureSurface.Detach()));
+                if (previous != nullptr) {
+                    previous->Release();
+                }
+            }
+        }
+    }
+    std::ostringstream details;
+    details << "type=" << static_cast<unsigned>(primitiveType)
+            << " start_vertex=" << startVertex
+            << " primitives=" << primitiveCount;
+    if (InterlockedCompareExchange(
+            &g_drawPrimitiveLogged, FALSE, FALSE) == FALSE) {
+        AppendDrawState(self, details);
+    }
+    LogRenderActivity(
+        &g_drawPrimitiveLogged, "d3d9_draw_primitive_activity",
+        result, details.str());
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalDrawIndexedPrimitive(
+    IDirect3DDevice9* self, D3DPRIMITIVETYPE primitiveType,
+    INT baseVertexIndex, UINT minimumVertexIndex, UINT vertexCount,
+    UINT startIndex, UINT primitiveCount) {
+    if (g_appLocalDrawIndexedPrimitive == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result = g_appLocalDrawIndexedPrimitive(
+        self, primitiveType, baseVertexIndex, minimumVertexIndex,
+        vertexCount, startIndex, primitiveCount);
+    const LONG sequence =
+        InterlockedIncrement(&g_renderActivitySequence);
+    InterlockedExchange(&g_lastDrawSequence, sequence);
+    InterlockedExchangePointer(
+        &g_lastDrawDevice, self);
+    std::ostringstream details;
+    details << "type=" << static_cast<unsigned>(primitiveType)
+            << " base_vertex=" << baseVertexIndex
+            << " min_vertex=" << minimumVertexIndex
+            << " vertices=" << vertexCount
+            << " start_index=" << startIndex
+            << " primitives=" << primitiveCount;
+    if (InterlockedCompareExchange(
+            &g_drawIndexedPrimitiveLogged, FALSE, FALSE) == FALSE) {
+        AppendDrawState(self, details);
+    }
+    LogRenderActivity(
+        &g_drawIndexedPrimitiveLogged,
+        "d3d9_draw_indexed_activity", result, details.str());
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalDrawPrimitiveUp(
+    IDirect3DDevice9* self, D3DPRIMITIVETYPE primitiveType,
+    UINT primitiveCount, const void* vertexStreamZeroData,
+    UINT vertexStreamZeroStride) {
+    if (g_appLocalDrawPrimitiveUp == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result = g_appLocalDrawPrimitiveUp(
+        self, primitiveType, primitiveCount,
+        vertexStreamZeroData, vertexStreamZeroStride);
+    const LONG sequence =
+        InterlockedIncrement(&g_renderActivitySequence);
+    InterlockedExchange(&g_lastDrawSequence, sequence);
+    InterlockedExchangePointer(&g_lastDrawDevice, self);
+    std::ostringstream details;
+    details << "type=" << static_cast<unsigned>(primitiveType)
+            << " primitives=" << primitiveCount
+            << " stride=" << vertexStreamZeroStride
+            << " vertex_data="
+            << (vertexStreamZeroData != nullptr ? 1 : 0);
+    if (InterlockedCompareExchange(
+            &g_drawPrimitiveUpLogged, FALSE, FALSE) == FALSE) {
+        AppendDrawState(self, details);
+    }
+    LogRenderActivity(
+        &g_drawPrimitiveUpLogged,
+        "d3d9_draw_primitive_up_activity",
+        result, details.str());
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalDrawIndexedPrimitiveUp(
+    IDirect3DDevice9* self, D3DPRIMITIVETYPE primitiveType,
+    UINT minimumVertexIndex, UINT vertexCount, UINT primitiveCount,
+    const void* indexData, D3DFORMAT indexDataFormat,
+    const void* vertexStreamZeroData, UINT vertexStreamZeroStride) {
+    if (g_appLocalDrawIndexedPrimitiveUp == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result = g_appLocalDrawIndexedPrimitiveUp(
+        self, primitiveType, minimumVertexIndex, vertexCount,
+        primitiveCount, indexData, indexDataFormat,
+        vertexStreamZeroData, vertexStreamZeroStride);
+    const LONG sequence =
+        InterlockedIncrement(&g_renderActivitySequence);
+    InterlockedExchange(&g_lastDrawSequence, sequence);
+    InterlockedExchangePointer(&g_lastDrawDevice, self);
+    std::ostringstream details;
+    details << "type=" << static_cast<unsigned>(primitiveType)
+            << " min_vertex=" << minimumVertexIndex
+            << " vertices=" << vertexCount
+            << " primitives=" << primitiveCount
+            << " index_format="
+            << static_cast<unsigned>(indexDataFormat)
+            << " stride=" << vertexStreamZeroStride
+            << " index_data=" << (indexData != nullptr ? 1 : 0)
+            << " vertex_data="
+            << (vertexStreamZeroData != nullptr ? 1 : 0);
+    if (InterlockedCompareExchange(
+            &g_drawIndexedPrimitiveUpLogged, FALSE, FALSE) == FALSE) {
+        AppendDrawState(self, details);
+    }
+    LogRenderActivity(
+        &g_drawIndexedPrimitiveUpLogged,
+        "d3d9_draw_indexed_up_activity",
+        result, details.str());
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalSetIndices(
+    IDirect3DDevice9* self, IDirect3DIndexBuffer9* indexBuffer) {
+    if (g_appLocalSetIndices == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    ComPtr<IDirect3DIndexBuffer9> inner;
+    IDirect3DIndexBuffer9* effectiveBuffer = indexBuffer;
+    if (indexBuffer != nullptr &&
+        SUCCEEDED(indexBuffer->QueryInterface(
+            kManagedIndexBufferInner,
+            reinterpret_cast<void**>(inner.GetAddressOf()))) &&
+        inner != nullptr) {
+        effectiveBuffer = inner.Get();
+    }
+    const HRESULT result =
+        g_appLocalSetIndices(self, effectiveBuffer);
+    if (indexBuffer == InterlockedCompareExchangePointer(
+            &g_managedIndexBuffer, nullptr, nullptr)) {
+        D3DINDEXBUFFER_DESC description{};
+        const HRESULT descriptionResult =
+            indexBuffer->GetDesc(&description);
+        std::ostringstream details;
+        details << "desc_hr=0x" << std::hex
+                << static_cast<std::uint32_t>(descriptionResult)
+                << " usage=0x" << description.Usage << std::dec
+                << " pool=" << static_cast<unsigned>(description.Pool)
+                << " format="
+                << static_cast<unsigned>(description.Format)
+                << " size=" << description.Size;
+        LogRenderActivity(
+            &g_managedIndexSetLogged,
+            "d3d9ex_managed_index_set",
+            result, details.str());
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookManagedIndexBufferLock(
+    IDirect3DIndexBuffer9* self, UINT offset, UINT size, void** data,
+    DWORD flags) {
+    if (g_managedIndexBufferLock == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result =
+        g_managedIndexBufferLock(self, offset, size, data, flags);
+    if (self == InterlockedCompareExchangePointer(
+            &g_managedIndexBuffer, nullptr, nullptr)) {
+        std::ostringstream details;
+        details << "offset=" << offset << " size=" << size
+                << " flags=0x" << std::hex << flags << std::dec
+                << " data="
+                << (data != nullptr && *data != nullptr ? 1 : 0);
+        LogRenderActivity(
+            &g_managedIndexLockLogged,
+            "d3d9ex_managed_index_lock",
+            result, details.str());
+    }
+    return result;
+}
+void AppendSurfaceDescription(
+    IDirect3DSurface9* surface, std::ostringstream& message) {
+    D3DSURFACE_DESC description{};
+    const HRESULT result = surface != nullptr
+        ? surface->GetDesc(&description)
+        : D3DERR_INVALIDCALL;
+    message << " ptr=0x" << std::hex
+            << reinterpret_cast<std::uintptr_t>(surface)
+            << " desc_hr=0x" << static_cast<std::uint32_t>(result)
+            << std::dec << " size=" << description.Width << 'x'
+            << description.Height << " format="
+            << static_cast<unsigned>(description.Format)
+            << " msaa="
+            << static_cast<unsigned>(description.MultiSampleType);
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalSetRenderTarget(
+    IDirect3DDevice9* self, DWORD index, IDirect3DSurface9* surface) {
+    if (g_appLocalSetRenderTarget == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result =
+        g_appLocalSetRenderTarget(self, index, surface);
+    const LONG trace =
+        InterlockedIncrement(&g_setRenderTargetTraceCount);
+    if (!g_endSceneCaptureActive) {
+        ComPtr<IDirect3DSurface9> backBuffer;
+        self->GetBackBuffer(
+            0, 0, D3DBACKBUFFER_TYPE_MONO,
+            backBuffer.GetAddressOf());
+        if (D3D9ExCompatibilityRequested() &&
+            SUCCEEDED(result) && index == 0 && surface != nullptr &&
+            surface != backBuffer.Get()) {
+            AcquireSRWLockExclusive(&g_renderTargetTraceLock);
+            bool known = false;
+            const LONG targetCount = InterlockedCompareExchange(
+                &g_engineRenderTargetCount, 0, 0);
+            for (LONG targetIndex = 0;
+                 targetIndex < targetCount; ++targetIndex) {
+                const TrackedRenderTarget& target =
+                    g_engineRenderTargets[
+                        static_cast<std::size_t>(targetIndex)];
+                if (target.device == self &&
+                    target.surface == surface) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known && targetCount <
+                    static_cast<LONG>(
+                        g_engineRenderTargets.size())) {
+                surface->AddRef();
+                TrackedRenderTarget& target =
+                    g_engineRenderTargets[
+                        static_cast<std::size_t>(targetCount)];
+                target.device = self;
+                target.surface = surface;
+                target.id = targetCount + 1;
+                InterlockedExchange(
+                    &g_engineRenderTargetCount,
+                    targetCount + 1);
+            }
+            ReleaseSRWLockExclusive(&g_renderTargetTraceLock);
+        }
+        if (trace <= 32) {
+            std::ostringstream message;
+            message << "trace=" << trace << " slot=" << index
+                    << " is_backbuffer="
+                    << (surface != nullptr &&
+                        surface == backBuffer.Get() ? 1 : 0);
+            AppendSurfaceDescription(surface, message);
+            message << " HRESULT=0x" << std::hex << std::uppercase
+                    << static_cast<std::uint32_t>(result);
+            GetBridge().LogHookStatus(
+                SUCCEEDED(result) ? "INFO" : "ERROR",
+                "d3d9_set_render_target", message.str());
+        }
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalStretchRect(
+    IDirect3DDevice9* self, IDirect3DSurface9* source,
+    const RECT* sourceRect, IDirect3DSurface9* destination,
+    const RECT* destinationRect, D3DTEXTUREFILTERTYPE filter) {
+    if (g_appLocalStretchRect == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const HRESULT result = g_appLocalStretchRect(
+        self, source, sourceRect, destination, destinationRect, filter);
+    const LONG trace =
+        InterlockedIncrement(&g_stretchRectTraceCount);
+    if (trace <= 32 && !g_endSceneCaptureActive) {
+        std::ostringstream message;
+        message << "trace=" << trace << " source";
+        AppendSurfaceDescription(source, message);
+        message << " destination";
+        AppendSurfaceDescription(destination, message);
+        message << " filter=" << static_cast<unsigned>(filter)
+                << " HRESULT=0x" << std::hex << std::uppercase
+                << static_cast<std::uint32_t>(result);
+        GetBridge().LogHookStatus(
+            SUCCEEDED(result) ? "INFO" : "ERROR",
+            "d3d9_stretch_rect", message.str());
+    }
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE HookLateReset(
     IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters) {
     if (g_lateReset == nullptr) {
         return D3DERR_INVALIDCALL;
+    }
+    if (D3D9ExCompatibilityRequested() && parameters != nullptr) {
+        D3DDEVICE_CREATION_PARAMETERS creation{};
+        HWND focusWindow = nullptr;
+        if (SUCCEEDED(self->GetCreationParameters(&creation))) {
+            focusWindow = creation.hFocusWindow;
+        }
+        TranslateD3D9ExPresentation(focusWindow, parameters);
     }
     ForceHighQualitySource(parameters);
     GetBridge().BeforeReset();
@@ -2819,7 +5580,8 @@ HRESULT STDMETHODCALLTYPE HookLatePresent(
     if (g_latePresent == nullptr) {
         return D3DERR_INVALIDCALL;
     }
-    GetBridge().CapturePresent(self);
+    CaptureDeviceBeforePresent(
+        self, overrideWindow, "late_device_present");
     return g_latePresent(self, source, destination, overrideWindow,
                          dirtyRegion);
 }
@@ -2984,6 +5746,11 @@ BOOL InstallLateD3D9Hooks() noexcept {
     }
     return g_lateHookResult;
 }
+BOOL AreLateD3D9HooksActive() noexcept {
+    return InterlockedCompareExchange(
+               &g_lateHooksActive, FALSE, FALSE) != FALSE;
+}
+
 
 BOOL IsHostConnected() noexcept {
     return GetBridge().IsConnected();

@@ -66,6 +66,129 @@ function Get-FileSha256([string]$Path) {
     }
 }
 
+function Get-FearVrAppLocalProxyState(
+    [string]$RetailRoot,
+    $Record
+) {
+    $target = [IO.Path]::GetFullPath((Join-Path $RetailRoot 'd3d9.dll'))
+    if ($null -eq $Record) {
+        return [pscustomobject]@{
+            Status = 'NoRecord'
+            Path = $target
+            Sha256 = Get-FileSha256 $target
+        }
+    }
+
+    $recordPath = [string]$Record.path
+    $recordHash = [string]$Record.sha256
+    if ([string]::IsNullOrWhiteSpace($recordPath) -or
+        [string]::IsNullOrWhiteSpace($recordHash)) {
+        return [pscustomobject]@{
+            Status = 'InvalidRecord'
+            Path = $target
+            Sha256 = Get-FileSha256 $target
+        }
+    }
+
+    try { $recordFull = [IO.Path]::GetFullPath($recordPath) } catch {
+        return [pscustomobject]@{
+            Status = 'InvalidRecord'
+            Path = $target
+            Sha256 = Get-FileSha256 $target
+        }
+    }
+    if (-not $recordFull.Equals(
+            $target, [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{
+            Status = 'InvalidRecord'
+            Path = $target
+            Sha256 = Get-FileSha256 $target
+        }
+    }
+
+    $currentHash = Get-FileSha256 $target
+    if (-not $currentHash) {
+        return [pscustomobject]@{
+            Status = 'Missing'
+            Path = $target
+            Sha256 = $null
+        }
+    }
+    return [pscustomobject]@{
+        Status = if ($currentHash -eq $recordHash) { 'Owned' } else { 'Modified' }
+        Path = $target
+        Sha256 = $currentHash
+    }
+}
+
+function Install-FearVrAppLocalProxy(
+    [string]$SourcePath,
+    [string]$RetailRoot,
+    $PreviousRecord
+) {
+    $source = [IO.Path]::GetFullPath($SourcePath)
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "F.E.A.R. VR proxy is missing: $source"
+    }
+    if (-not (Test-Path -LiteralPath $RetailRoot -PathType Container)) {
+        throw "Retail folder is missing: $RetailRoot"
+    }
+
+    $target = [IO.Path]::GetFullPath((Join-Path $RetailRoot 'd3d9.dll'))
+    $sourceHash = Get-FileSha256 $source
+    $currentHash = Get-FileSha256 $target
+    if ($currentHash -and $currentHash -ne $sourceHash) {
+        $previousState =
+            Get-FearVrAppLocalProxyState $RetailRoot $PreviousRecord
+        if ($previousState.Status -ne 'Owned') {
+            throw @"
+Refusing to overwrite an existing app-local Direct3D wrapper:
+  $target
+
+Its SHA-256 is not owned by this F.E.A.R. VR installation. It may belong to
+ReShade, DXVK, another mod, or a manual backup. Remove or chain that wrapper
+explicitly before installing F.E.A.R. VR.
+"@
+        }
+    }
+
+    if ($currentHash -ne $sourceHash) {
+        Copy-Item -LiteralPath $source -Destination $target -Force
+    }
+    $installedHash = Get-FileSha256 $target
+    if ($installedHash -ne $sourceHash) {
+        throw "App-local proxy verification failed after copy: $target"
+    }
+    return [ordered]@{
+        path = $target
+        sha256 = $installedHash
+        bytes = (Get-Item -LiteralPath $target).Length
+        owner = 'fearvr'
+    }
+}
+
+function Remove-FearVrAppLocalProxy(
+    [string]$RetailRoot,
+    $Record,
+    [switch]$Apply
+) {
+    $state = Get-FearVrAppLocalProxyState $RetailRoot $Record
+    if ($state.Status -ne 'Owned') { return $state }
+    if (-not $Apply) {
+        return [pscustomobject]@{
+            Status = 'WouldRemove'
+            Path = $state.Path
+            Sha256 = $state.Sha256
+        }
+    }
+    Remove-Item -LiteralPath $state.Path -Force
+    return [pscustomobject]@{
+        Status = 'Removed'
+        Path = $state.Path
+        Sha256 = $state.Sha256
+    }
+}
+
 # Verifiziert eine Retail-FEAR.exe. Die Version 1.08 ist Bedingung — die
 # Public-Tools-Module passen zu keiner anderen. Der Hash entscheidet dagegen
 # nur noch darüber, ob dieser Build getestet ist: Steam, GOG und die

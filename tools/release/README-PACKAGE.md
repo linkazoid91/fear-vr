@@ -59,6 +59,15 @@ cannot be found, the installer shows examples and asks for it.
 > archive configuration and aborts with "Failed to initialize client - unable
 > to load game resources". The installer rejects such targets.
 
+The installer also places one reversible file beside `FEAR.exe`:
+`d3d9.dll`. Loading this proxy at process startup intercepts the exact Retail
+presentation path. The compatible classic-D3D9 CPU transfer is the default;
+the experimental `-D3D9Ex` zero-copy mode currently renders Retail 1.08
+managed resources black on the confirmed Steam build. The proxy's exact path
+and SHA-256 are stored in `deployment.json`. An existing different `d3d9.dll`
+is never overwritten; remove or explicitly chain ReShade, DXVK, or another
+wrapper before installing.
+
 Options:
 
 ```powershell
@@ -109,6 +118,9 @@ tools\play.ps1 -Runtime steamvr   # force SteamVR
 tools\play.ps1 -Translation       # limited HMD translation (opt-in)
 tools\play.ps1 -NoHeadBob         # force head bob off (already off by default)
 tools\play.ps1 -NoStereoHud       # troubleshooting only
+tools\play.ps1 -NoGpuHud          # bypass the GPU HUD compositor for diagnosis
+tools\play.ps1 -MagentaSurfaceTest # one-frame presentation-source test
+tools\play.ps1 -D3D9Ex            # experimental zero-copy; may render black
 ```
 
 `-Runtime` sets `XR_RUNTIME_JSON` for the host process only. The system-wide
@@ -177,18 +189,21 @@ powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1 -Apply   # remove
 **Saved games are kept.** They live in `<InstallDir>\userdata` and are only
 removed with `-IncludeUserData`.
 
-The retail installation is never written to at any point. A Steam file
-verification is not needed; as far as Steam is concerned the installation is
-unmodified.
+Uninstall removes the app-local `d3d9.dll` only when its current SHA-256 still
+matches the deployment record. A modified or foreign file is preserved.
+`FEAR.exe`, archives, and retail game data are never modified.
 
 ## Known limits
 
-- The classic D3D9 path still needs one CPU readback per eye and frame
-  (`FEARVR_BF_CPU_FALLBACK` in the log). F.E.A.R. creates a plain
-  `IDirect3DDevice9`, and D3D9 can only share surfaces between processes from
-  a D3D9Ex device — so this is the one remaining copy. The zero-copy
-  `DirectShared` path exists and engages as soon as the device is an Ex
-  device.
+- The app-local proxy presents the classic `IDirect3D9` API expected by
+  F.E.A.R. while creating an internal `IDirect3DDevice9Ex`. Retail managed
+  resources are translated to lockable dynamic default-pool resources. This
+  removes the per-eye CPU readback and selects `path=direct`; unusual resource
+  formats or code that depends on `GetDesc().Pool == D3DPOOL_MANAGED` may
+  still require a fuller shadow-resource compatibility layer.
+- If the tracked proxy is missing, the launcher warns and uses the slower
+  classic CPU-copy path. If a different app-local `d3d9.dll` is present, it
+  stops instead of loading untracked code.
 - The stereo HUD compositor, by contrast, **no longer reads back**: the pixel
   comparison runs as a `ps_2_0` shader on the GPU, and the coverage heuristic
   that separates the HUD from fullscreen effects reads a few kilobytes one

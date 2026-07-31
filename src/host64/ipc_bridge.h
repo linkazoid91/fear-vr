@@ -65,6 +65,7 @@ private:
     void UpdateAdapterMatch();
     void UpdateGameHeartbeat();
     bool FinishPendingCopy();
+    bool ProbePrivatePixels(std::uint32_t eye);
     bool FindAndClaimPair(std::uint32_t& slotIndex,
                           std::uint64_t& frameId,
                           std::uint64_t& generation);
@@ -106,6 +107,8 @@ private:
     bool protocolRejected_{false};
     bool adapterMatchLogged_{false};
     bool adapterMismatchLogged_{false};
+    std::uint32_t pixelProbeAttempts_{0};
+    std::uint32_t pixelProbeNonBlackMask_{0};
 };
 
 } // namespace fearvr

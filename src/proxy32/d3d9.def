@@ -23,6 +23,7 @@ EXPORTS
     FearVr_EndStereoFrame
     FearVr_ReportHookStatus
     FearVr_InstallIatHook
+    FearVr_AreLateHooksActive
     FearVr_Ordinal16 @16 NONAME
     FearVr_Ordinal17 @17 NONAME
     FearVr_Ordinal18 @18 NONAME

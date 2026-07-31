@@ -4,8 +4,10 @@
 
 .DESCRIPTION
     Builds an isolated game stage in a folder of its own. The retail
-    installation is only ever read, never written, so a Steam file
-    verification stays clean.
+    executable and game data stay unchanged. One reversible app-local
+    d3d9.dll proxy is installed beside FEAR.exe so Direct3D is intercepted
+    before the game creates its device. Its exact SHA-256 is recorded for
+    safe updates and uninstall.
 
     Updating is the same command: run this script from the new package. An
     existing installation is detected, its paths are reused, its modules are
@@ -399,7 +401,38 @@ $archiveLines = @(
 $archiveLines += $moduleDirectory
 [IO.File]::WriteAllLines($archiveConfig, $archiveLines, [Text.Encoding]::ASCII)
 
-# --- 6. Deployment manifest -------------------------------------------------
+# --- 6. Early app-local Direct3D proxy -------------------------------------
+$proxySource = Join-Path $packageRoot $cfg.BundledModules['fearvr-d3d9.dll']
+$previousProxy = if ($previous) { $previous.d3d9Proxy } else { $null }
+$proxyRecord = Install-FearVrAppLocalProxy `
+    -SourcePath $proxySource `
+    -RetailRoot $RetailRoot `
+    -PreviousRecord $previousProxy
+Write-Host "  [OK] App-local Direct3D proxy: $($proxyRecord.path)"
+
+# If an update explicitly moved to another Retail installation, clean up the
+# old proxy only when its recorded hash still proves that it is ours.
+if ($previous -and $previous.d3d9Proxy -and $previous.retailRoot) {
+    $oldTarget = [IO.Path]::GetFullPath(
+        (Join-Path ([string]$previous.retailRoot) 'd3d9.dll'))
+    if (-not $oldTarget.Equals(
+            [string]$proxyRecord.path,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        $oldRemoval = Remove-FearVrAppLocalProxy `
+            -RetailRoot ([string]$previous.retailRoot) `
+            -Record $previous.d3d9Proxy `
+            -Apply
+        if ($oldRemoval.Status -eq 'Removed') {
+            Write-Host "  [OK] Removed previous proxy: $($oldRemoval.Path)"
+        } elseif ($oldRemoval.Status -eq 'Modified') {
+            Write-Host (
+                '  [!] Previous app-local d3d9.dll was modified and was kept: ' +
+                $oldRemoval.Path) -ForegroundColor Yellow
+        }
+    }
+}
+
+# --- 7. Deployment manifest -------------------------------------------------
 $records = foreach ($name in $staged.Keys) {
     $path = Join-Path $moduleDirectory $name
     [ordered]@{
@@ -429,9 +462,11 @@ $deployment = Join-Path $InstallDir 'deployment.json'
     userDirectory = $userDirectory
     logDirectory = $logDirectory
     files = @($records)
+    d3d9Proxy = $proxyRecord
+    d3d9ExCompatibility = $true
 } | ConvertTo-Json -Depth 5 | Out-File -Encoding utf8 -LiteralPath $deployment
 
-# --- 7. Shortcut ------------------------------------------------------------
+# --- 8. Shortcut ------------------------------------------------------------
 $playScript = Join-Path $PSScriptRoot 'play.ps1'
 if (-not $NoShortcut) {
     $shortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'F.E.A.R. VR.lnk'
@@ -449,7 +484,7 @@ if (-not $NoShortcut) {
     Write-Host "  [OK] Shortcut: $shortcut"
 }
 
-# --- 8. Retail must be unchanged --------------------------------------------
+# --- 9. Retail executable must be unchanged --------------------------------
 $retailAfter = Assert-RetailFearExe $RetailRoot
 if ($retail.Sha256 -ne $retailAfter.Sha256) {
     throw 'SAFETY ABORT: the retail FEAR.exe was modified.'
@@ -458,11 +493,13 @@ if ($retail.Sha256 -ne $retailAfter.Sha256) {
 Write-Host ''
 if ($previous) {
     Write-Host ("Update complete ($($previous.packageVersion) -> " +
-        "$($package.version)); retail untouched.") -ForegroundColor Green
+        "$($package.version)).") -ForegroundColor Green
     Write-Host 'Saved games and profiles were kept.'
 } else {
-    Write-Host 'Installation complete; retail untouched.' -ForegroundColor Green
+    Write-Host 'Installation complete.' -ForegroundColor Green
 }
+Write-Host 'FEAR.exe and retail game data are unchanged.'
+Write-Host 'The reversible app-local d3d9.dll proxy is hash-tracked.'
 Write-Host "Install folder: $InstallDir"
 Write-Host ''
 Write-Host 'Play:'

@@ -91,8 +91,10 @@ powershell -ExecutionPolicy Bypass -File tools\install.ps1
 
 That is the whole command for a normal setup. It detects the game and the
 Public Tools, builds an isolated stage under `%USERPROFILE%\FearVR`, and
-creates a desktop shortcut named **F.E.A.R. VR**. The retail installation is
-only read, never written — a Steam file verification stays clean.
+creates a desktop shortcut named **F.E.A.R. VR**. It also installs one
+hash-tracked, reversible `d3d9.dll` beside `FEAR.exe` so the bridge loads
+before the D3D device is created. Existing different D3D wrappers are refused,
+not overwritten.
 
 If a path cannot be detected, the installer prints examples and asks for it.
 You can also pass paths up front:
@@ -329,9 +331,10 @@ something is built but not yet verified in-game, it's noted.
 
 ## Core Principles
 
-- **Retail stays untouched.** Nothing is written into the Steam installation
-  and no original EXE/DLL/archive file is overwritten. All work happens in an
-  isolated stage under the project root (`stage/`) with its own
+- **Original Retail files stay untouched.** No original EXE, DLL, or archive
+  is overwritten. Release setup adds only a hash-tracked app-local `d3d9.dll`
+  proxy; uninstall removes it only while its hash still matches. Modules,
+  mutable state, and logs remain in the isolated stage with its own
   `-userdirectory`.
 - **No retail/SDK/asset files in Git.** See `.gitignore`.
 - **Separate processes by bitness:** an x64 OpenXR host owns the OpenXR
@@ -572,16 +575,15 @@ it sees SteamVR running.
 
 ## Known Limitations
 
-- The classic D3D9 path still requires a CPU readback per eye and frame
-  (`FEARVR_BF_CPU_FALLBACK`). F.E.A.R. creates a plain `IDirect3DDevice9`, and
-  D3D9 can only share surfaces across processes from a D3D9Ex device — so this
-  is the one remaining copy. The zero-copy `DirectShared` path already exists
-  and engages the moment the device is an Ex device; getting there needs a
-  wrapper for textures and buffers, because `D3DPOOL_MANAGED` does not exist on
-  Ex devices. **The stereo HUD compositor no longer reads back**: the pixel
-  comparison runs as a `ps_2_0` shader on the GPU, and its coverage heuristic
-  reads a few kilobytes one frame late instead of a full frame. That removed
-  one of three readbacks and all per-pixel CPU work. `-fearvr-no-gpu-hud`
+- Retail uses classic D3D9 with the CPU transfer path by default. The
+  experimental `tools\play.ps1 -D3D9Ex` mode enables zero-copy
+  `DirectShared`, but the confirmed Steam 1.08 build currently renders black:
+  translating managed textures and buffers to dynamic default-pool resources
+  is not a complete managed-resource emulation. A CPU shadow-resource wrapper
+  is required before D3D9Ex can become the default again.
+- **The stereo HUD compositor no longer reads back**: the pixel comparison
+  runs as a `ps_2_0` shader on the GPU, and its coverage heuristic reads a few
+  kilobytes one frame late instead of a full frame. `-fearvr-no-gpu-hud`
   forces the old CPU compositor back.
 - HMD translation has no world collision and therefore remains opt-in
   (`-Translation`).

@@ -127,6 +127,15 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND TARGET fearvr-proxy)
       "$<TARGET_FILE_DIR:d3d9_test_producer>/d3d9.dll"
     COMMENT "Staging M2 d3d9.dll beside the isolated test producer"
   )
+  add_test(
+    NAME d3d9ex_compat_smoke
+    COMMAND d3d9_test_producer
+      -fearvr-d3d9ex-compat
+      --compat-smoke
+  )
+  set_tests_properties(
+    d3d9ex_compat_smoke PROPERTIES LABELS "d3d9;gpu;compatibility"
+  )
 
   # Separates Ausgabeverzeichnis ohne lokalen d3d9.dll-Proxy: simuliert den
   # archcfg-Loader, der die eindeutig benannte Bridge lädt und die EXE-IAT
@@ -137,6 +146,37 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND TARGET fearvr-proxy)
   set_target_properties(iat_hook_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/iat-test"
   )
+
+  # Simulates Retail's early app-local proxy load, then initializes the
+  # archcfg GameClient loader. The loader must reuse d3d9.dll instead of
+  # loading fearvr-d3d9.dll as a second bridge instance.
+  add_executable(gameclient_bridge_reuse_test
+    gameclient_bridge_reuse_test.cpp
+  )
+  target_link_libraries(gameclient_bridge_reuse_test PRIVATE
+    fearvr-warnings
+    d3d9
+  )
+  add_dependencies(gameclient_bridge_reuse_test
+    fearvr-proxy
+    fearvr-gameclient-loader
+  )
+  set_target_properties(gameclient_bridge_reuse_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bridge-reuse-test"
+  )
+  add_custom_command(TARGET gameclient_bridge_reuse_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:fearvr-proxy>"
+      "$<TARGET_FILE_DIR:gameclient_bridge_reuse_test>/d3d9.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:fearvr-proxy>"
+      "$<TARGET_FILE_DIR:gameclient_bridge_reuse_test>/fearvr-d3d9.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:fearvr-gameclient-loader>"
+      "$<TARGET_FILE_DIR:gameclient_bridge_reuse_test>/GameClient.dll"
+  )
+  add_test(NAME gameclient_bridge_reuse
+    COMMAND gameclient_bridge_reuse_test)
 endif()
 
 # Weitere Testziele folgen pro Meilenstein:

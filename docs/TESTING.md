@@ -608,6 +608,31 @@ Einordnung:
 
 Damit ist die Kennzahlenpflicht aus §14 erfüllt.
 
+### D3D9Ex-Zero-Copy-Retail-Gate, geprüft am 30.07.2026
+
+Hardware/Runtime: RTX 4090, VirtualDesktopXR 1.0.10, Meta Quest 3,
+OpenXR-Swapchains 2×3072x3264. Live-Logs:
+`C:\Users\noob_\FearVR\logs\fearvr-20260729-154321`.
+
+| Prüfung | Ergebnis |
+|---|---|
+| Frühes Laden | `d3d9ex_compat_factory` vor dem Retail-Gerät |
+| Classic-zu-Ex-Gerät | Vollbild 1280x1024, normalisiert auf 240 Hz, `HRESULT=0x00000000` |
+| Bildtransport | Shared-Texture 1280x1024 B8G8R8A8, 3 Slots je Auge, `path=direct` |
+| CPU-Fallback | kein `cpu_d3d9ex`, kein `path=cpu` |
+| Host | 89,7–90,0 XR-fps nach Start |
+| Spielbildrate | 129,2–177,0 fps in den ersten stabilen Messfenstern; später 77,4 fps mit 47 Wiederholungen |
+| Host-Copy | 76–87 µs im stabilen Abschnitt |
+| Integrität | Proxy-Hash `Owned`; `FEAR.exe` weiterhin `D5EBC38A…B82B4CBE` |
+
+Der erste Retail-Versuch legte außerdem eine echte Kompatibilitätsabweichung
+offen: Classic D3D9 akzeptiert im Vollbild
+`FullScreen_RefreshRateInHz = 0`, `CreateDeviceEx` antwortete damit aber
+`D3DERR_INVALIDCALL`. Die Fassade enumeriert nun den passenden Ex-Modus und
+schreibt denselben konkreten Refresh in Präsentations- und Vollbildstruktur.
+Der isolierte Vollbildtest reproduziert ausdrücklich den Refresh-0-Aufruf und
+prüft zusätzlich Ex-Interface und alle übersetzten Managed-Ressourcentypen.
+
 ### Runtime-Unabhängigkeit, geprüft am 25.07.2026
 
 | Prüfung | Ergebnis |

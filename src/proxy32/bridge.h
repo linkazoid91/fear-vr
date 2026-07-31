@@ -17,6 +17,7 @@ using StereoToggleCallback = void(__cdecl*)(BOOL enabled);
 void OnDirect3D9Created(IDirect3D9* direct3D) noexcept;
 void OnDirect3D9ExCreated(IDirect3D9Ex* direct3D) noexcept;
 BOOL InstallLateD3D9Hooks() noexcept;
+BOOL AreLateD3D9HooksActive() noexcept;
 
 BOOL IsHostConnected() noexcept;
 BOOL IsStereoAvailable() noexcept;
