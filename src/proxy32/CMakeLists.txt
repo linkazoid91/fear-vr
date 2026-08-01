@@ -1,9 +1,9 @@
-# x86 d3d9.dll Proxy/Bridge — ANWEISUNG.md §5.2
+# x86 D3D9 proxy/bridge — ANWEISUNG.md §5.2
 #
-# Baut die Bridge unter dem eindeutigen Namen fearvr-d3d9.dll. Der synthetische
-# Test kopiert sie ausschließlich in sein eigenes Ausgabeverzeichnis als
-# d3d9.dll. Die echte FEAR-Stage lädt den eindeutigen Namen über den
-# ABI-neutralen archcfg-Loader. NIEMALS in die Retail-Installation kopieren.
+# Build one bridge binary under the unique staged name fearvr-d3d9.dll.
+# Release installation also deploys the same binary as a hash-tracked
+# app-local d3d9.dll beside FEAR.exe for early interception. Isolated tests
+# stage their own private d3d9.dll copies.
 set(FEARVR_MINHOOK_ROOT
   "${CMAKE_SOURCE_DIR}/vendor-local/minhook"
   CACHE PATH "Local pinned checkout of MinHook")
@@ -21,6 +21,8 @@ add_subdirectory(
 add_library(fearvr-proxy SHARED
   bridge.cpp
   bridge.h
+  d3d9ex_compat.cpp
+  d3d9ex_compat.h
   d3d9.def
   dllmain.cpp
   iat_hook.cpp
@@ -38,8 +40,8 @@ target_link_libraries(fearvr-proxy PRIVATE
   shell32
 )
 
-# Eindeutiger Modulname für die offizielle archcfg-Stage. Der isolierte
-# D3D9-Test kopiert dieselbe Binärdatei gezielt als d3d9.dll neben seine EXE.
+# Keep the unique name in the archcfg stage. Release installation and isolated
+# tests deliberately copy the same binary as d3d9.dll at their own targets.
 set_target_properties(fearvr-proxy PROPERTIES
   OUTPUT_NAME "fearvr-d3d9"
   PREFIX ""

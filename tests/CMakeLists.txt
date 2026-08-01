@@ -1,4 +1,4 @@
-# Automatisierte Tests (ANWEISUNG.md §14). Baubar ohne Headset.
+# Automated tests (ANWEISUNG.md section 14). Buildable without a headset.
 add_executable(test_protocol test_protocol.cpp)
 target_link_libraries(test_protocol PRIVATE fearvr-common fearvr-warnings)
 add_test(NAME protocol COMMAND test_protocol)
@@ -33,8 +33,8 @@ add_executable(test_controller_mapping test_controller_mapping.cpp)
 target_link_libraries(
   test_controller_mapping PRIVATE fearvr-common fearvr-warnings
 )
-# Der Test prüft ausschließlich über assert; RelWithDebInfo definiert sonst
-# NDEBUG und der Test liefe wirkungslos durch.
+# This test checks only through assert; RelWithDebInfo otherwise defines
+# NDEBUG and would make the test ineffective.
 if(MSVC)
   target_compile_options(test_controller_mapping PRIVATE /UNDEBUG)
 endif()
@@ -122,32 +122,106 @@ endif()
 add_test(NAME render_scale COMMAND test_render_scale)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND TARGET fearvr-proxy)
-  # Isolierter M2-Producer: Der echte System-Import bleibt d3d9.lib; erst
-  # nach dem Link wird ausschließlich neben diese Test-EXE der Proxy kopiert.
+  # Isolated M2 producer: the system import remains d3d9.lib. A dependency
+  # target refreshes the app-local proxy before every producer build.
   add_executable(d3d9_test_producer d3d9_test_producer.cpp)
   target_link_libraries(d3d9_test_producer PRIVATE
     fearvr-warnings
     d3d9
   )
-  add_dependencies(d3d9_test_producer fearvr-proxy)
-  add_custom_command(TARGET d3d9_test_producer POST_BUILD
+  add_custom_target(stage_d3d9_test_proxy
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+      "$<TARGET_FILE_DIR:d3d9_test_producer>"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "$<TARGET_FILE:fearvr-proxy>"
       "$<TARGET_FILE_DIR:d3d9_test_producer>/d3d9.dll"
+    DEPENDS fearvr-proxy
     COMMENT "Staging M2 d3d9.dll beside the isolated test producer"
   )
+  add_dependencies(d3d9_test_producer stage_d3d9_test_proxy)
+  add_test(
+    NAME d3d9ex_compat_smoke
+    COMMAND d3d9_test_producer
+      -fearvr-d3d9ex-compat
+      --compat-smoke
+  )
+  set_tests_properties(
+    d3d9ex_compat_smoke PROPERTIES LABELS "d3d9;gpu;compatibility"
+  )
+  add_test(
+    NAME d3d9ex_compat_present_ex_smoke
+    COMMAND d3d9_test_producer
+      -fearvr-d3d9ex-compat
+      --compat-smoke
+      --present-ex
+  )
+  set_tests_properties(
+    d3d9ex_compat_present_ex_smoke
+    PROPERTIES LABELS "d3d9;gpu;compatibility"
+  )
+  add_test(
+    NAME d3d9ex_compat_swapchain_present_smoke
+    COMMAND d3d9_test_producer
+      -fearvr-d3d9ex-compat
+      --compat-smoke
+      --swapchain-present
+  )
+  set_tests_properties(
+    d3d9ex_compat_swapchain_present_smoke
+    PROPERTIES LABELS "d3d9;gpu;compatibility"
+  )
 
-  # Separates Ausgabeverzeichnis ohne lokalen d3d9.dll-Proxy: simuliert den
-  # archcfg-Loader, der die eindeutig benannte Bridge lädt und die EXE-IAT
-  # patcht, während Windows' System-d3d9 bereits importiert ist.
+  # A separate output directory without a local d3d9.dll proxy simulates the
+  # archcfg loader loading the uniquely named bridge and patching the EXE IAT
+  # after Windows has already imported the system d3d9 library.
   add_executable(iat_hook_test iat_hook_test.cpp)
   target_link_libraries(iat_hook_test PRIVATE fearvr-warnings d3d9)
   add_dependencies(iat_hook_test fearvr-proxy)
   set_target_properties(iat_hook_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/iat-test"
   )
+  add_test(NAME d3d9_iat_hook
+    COMMAND iat_hook_test "$<TARGET_FILE:fearvr-proxy>")
+  set_tests_properties(d3d9_iat_hook PROPERTIES LABELS "d3d9;gpu;iat")
+
+  # Simulates Retail's early app-local proxy load, then initializes the
+  # archcfg GameClient loader. The loader must reuse d3d9.dll instead of
+  # loading fearvr-d3d9.dll as a second bridge instance.
+  add_executable(gameclient_bridge_reuse_test
+    gameclient_bridge_reuse_test.cpp
+  )
+  target_link_libraries(gameclient_bridge_reuse_test PRIVATE
+    fearvr-warnings
+    d3d9
+  )
+  set_target_properties(gameclient_bridge_reuse_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bridge-reuse-test"
+  )
+  add_custom_target(stage_gameclient_bridge_reuse
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+      "$<TARGET_FILE_DIR:gameclient_bridge_reuse_test>"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+      "$<TARGET_FILE_DIR:gameclient_bridge_reuse_test>/modules"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:fearvr-proxy>"
+      "$<TARGET_FILE_DIR:gameclient_bridge_reuse_test>/d3d9.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:fearvr-proxy>"
+      "$<TARGET_FILE_DIR:gameclient_bridge_reuse_test>/modules/fearvr-d3d9.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:fearvr-gameclient-loader>"
+      "$<TARGET_FILE_DIR:gameclient_bridge_reuse_test>/modules/GameClient.dll"
+    DEPENDS
+      fearvr-proxy
+      fearvr-gameclient-loader
+  )
+  add_dependencies(gameclient_bridge_reuse_test
+    stage_gameclient_bridge_reuse
+  )
+  add_test(NAME gameclient_bridge_reuse
+    COMMAND gameclient_bridge_reuse_test)
 endif()
 
-# Weitere Testziele folgen pro Meilenstein:
-#   - test_math       (Quaternion, Achsenabbildung, Pose, FOV->Projektion)
-#   - test_ringbuffer (Generationen, Timeoutpfade)
+# Additional test targets follow by milestone:
+#   - test_math       (quaternion, axis mapping, pose, FOV-to-projection)
+#   - test_ringbuffer (generations and timeout paths)

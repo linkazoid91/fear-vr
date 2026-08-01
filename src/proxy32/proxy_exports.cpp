@@ -1,4 +1,5 @@
 #include "bridge.h"
+#include "d3d9ex_compat.h"
 #include "iat_hook.h"
 #include "system_d3d9.h"
 
@@ -14,6 +15,19 @@ Function Required(const char* name) noexcept {
 } // namespace
 
 extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
+    if (fearvr::D3D9ExCompatibilityRequested()) {
+        IDirect3D9* compatibility =
+            fearvr::CreateD3D9ExCompatibility(sdkVersion);
+        if (compatibility != nullptr) {
+            fearvr::ReportHookStatus(
+                "INFO", "d3d9ex_compat_factory",
+                "Direct3DCreate9 is backed by Direct3DCreate9Ex.");
+            return compatibility;
+        }
+        fearvr::ReportHookStatus(
+            "WARN", "d3d9ex_compat_factory_failed",
+            "Direct3DCreate9Ex compatibility failed; classic D3D9 resumed.");
+    }
     using Function = IDirect3D9*(WINAPI*)(UINT);
     const Function real = Required<Function>("Direct3DCreate9");
     if (real == nullptr) {
@@ -32,9 +46,13 @@ extern "C" HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion,
     if (real == nullptr) {
         return HRESULT_FROM_WIN32(fearvr::SystemD3D9LoadError());
     }
-    const HRESULT result = real(sdkVersion, output);
-    if (SUCCEEDED(result) && output != nullptr) {
-        fearvr::OnDirect3D9ExCreated(*output);
+    HRESULT result = real(sdkVersion, output);
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr &&
+        !fearvr::OnDirect3D9ExCreated(*output) &&
+        fearvr::D3D9ExCompatibilityRequested()) {
+        (*output)->Release();
+        *output = nullptr;
+        result = D3DERR_NOTAVAILABLE;
     }
     return result;
 }
@@ -62,10 +80,14 @@ extern "C" HRESULT WINAPI Direct3DCreate9On12Ex(
     if (real == nullptr) {
         return HRESULT_FROM_WIN32(fearvr::SystemD3D9LoadError());
     }
-    const HRESULT result =
+    HRESULT result =
         real(sdkVersion, overrideList, overrideCount, output);
-    if (SUCCEEDED(result) && output != nullptr) {
-        fearvr::OnDirect3D9ExCreated(*output);
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr &&
+        !fearvr::OnDirect3D9ExCreated(*output) &&
+        fearvr::D3D9ExCompatibilityRequested()) {
+        (*output)->Release();
+        *output = nullptr;
+        result = D3DERR_NOTAVAILABLE;
     }
     return result;
 }
@@ -220,13 +242,41 @@ extern "C" void FearVr_ReportHookStatus(
     fearvr::ReportHookStatus(level, event, message);
 }
 
+extern "C" void FearVr_ApplyEngineFixes() {
+    fearvr::ApplyEngineFixes();
+}
+
 extern "C" BOOL FearVr_InstallIatHook() {
     fearvr::ApplyEngineFixes();
     const BOOL iatInstalled =
         fearvr::InstallDirect3DCreate9IatHook(
             reinterpret_cast<void*>(&Direct3DCreate9));
+    if (fearvr::D3D9ExCompatibilityRequested()) {
+        fearvr::ReportHookStatus(
+            iatInstalled ? "INFO" : "ERROR",
+            "d3d9ex_iat_only",
+            iatInstalled
+                ? "The compatibility factory owns the executable IAT; "
+                  "legacy late hooks were skipped."
+                : "The compatibility factory could not take ownership of "
+                  "the executable Direct3DCreate9 import.");
+        return iatInstalled;
+    }
     const BOOL lateHooksInstalled = fearvr::InstallLateD3D9Hooks();
     return iatInstalled || lateHooksInstalled;
+}
+
+extern "C" BOOL FearVr_AreLateHooksActive() {
+    return fearvr::AreLateD3D9HooksActive();
+}
+
+extern "C" std::uint64_t FearVr_GetPresentHookCount(
+    std::uint32_t kind) {
+    return fearvr::PresentHookCount(kind);
+}
+
+extern "C" std::uint32_t FearVr_GetManagedIndexBindingCount() {
+    return fearvr::ManagedIndexBindingCount();
 }
 
 #if !defined(_M_IX86)

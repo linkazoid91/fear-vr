@@ -91,8 +91,10 @@ powershell -ExecutionPolicy Bypass -File tools\install.ps1
 
 That is the whole command for a normal setup. It detects the game and the
 Public Tools, builds an isolated stage under `%USERPROFILE%\FearVR`, and
-creates a desktop shortcut named **F.E.A.R. VR**. The retail installation is
-only read, never written — a Steam file verification stays clean.
+creates a desktop shortcut named **F.E.A.R. VR**. It also installs one
+hash-tracked, reversible `d3d9.dll` beside `FEAR.exe` so the bridge loads
+before the D3D device is created. Existing different D3D wrappers are refused,
+not overwritten.
 
 If a path cannot be detected, the installer prints examples and asks for it.
 You can also pass paths up front:
@@ -134,8 +136,9 @@ replaces the modules, and drops any module a newer package no longer uses.
 the installer refuses to run while `FEAR.exe` is open, because the staged
 modules are locked then.
 
-Add `-Clean` to wipe the install folder except `userdata` before staging
-again, if an installation ever ends up in a strange state.
+Add `-Clean` to perform deferred cleanup after the replacement deployment
+commits. Cleanup is limited to paths recorded as owned by the previous
+deployment; `userdata`, unrecognized files, and reparse points are kept.
 
 ### 5. Play
 
@@ -161,8 +164,10 @@ powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1 -Apply   # remove
 ```
 
 Saved games and profiles under `<InstallDir>\userdata` are kept unless you add
-`-IncludeUserData`. Since nothing was ever written into the retail folder,
-there is nothing to repair there.
+`-IncludeUserData`. Uninstall also removes the app-local `d3d9.dll` beside
+`FEAR.exe` only when its recorded ownership hash still matches; a changed or
+foreign wrapper is preserved. `FEAR.exe` and the retail game data are never
+modified.
 
 ### Game editions
 
@@ -329,9 +334,10 @@ something is built but not yet verified in-game, it's noted.
 
 ## Core Principles
 
-- **Retail stays untouched.** Nothing is written into the Steam installation
-  and no original EXE/DLL/archive file is overwritten. All work happens in an
-  isolated stage under the project root (`stage/`) with its own
+- **Original Retail files stay untouched.** No original EXE, DLL, or archive
+  is overwritten. Release setup adds only a hash-tracked app-local `d3d9.dll`
+  proxy; uninstall removes it only while its hash still matches. Modules,
+  mutable state, and logs remain in the isolated stage with its own
   `-userdirectory`.
 - **No retail/SDK/asset files in Git.** See `.gitignore`.
 - **Separate processes by bitness:** an x64 OpenXR host owns the OpenXR
@@ -542,11 +548,13 @@ settings.
 
 ## Uninstall
 
-Outside the project root, the mod writes exactly **one** file:
-`steamvr.vrsettings`, and there only the key
-`steamvr.autoShowGameTheater`. There is no registry change and no write to the
-retail installation. (`tools\install-echopatch.ps1` would place two files in
-the retail folder, but EchoPatch is not installed — see above.)
+The developer-workspace tools may update one key in `steamvr.vrsettings`:
+`steamvr.autoShowGameTheater`. The release installer separately deploys a
+hash-tracked app-local `d3d9.dll` beside `FEAR.exe`; uninstall removes it only
+while its recorded ownership still matches. Neither workflow modifies
+`FEAR.exe` or retail game data, and neither changes the registry.
+(`tools\install-echopatch.ps1` would place two additional files in the retail
+folder, but EchoPatch is not installed — see above.)
 
 ```powershell
 pwsh -File tools\uninstall-fearvr.ps1          # dry run, changes nothing
@@ -563,8 +571,9 @@ data, not mod files; they are only removed with `-IncludeUserData`.
 Additional switches: `-KeepLogs`, `-IncludeVendor` and
 `-Scope SteamVrOnly|ProjectOnly`.
 
-A Steam file integrity check is not needed, because retail was never written
-to. The script verifies the SHA-256 of `FEAR.exe` before and after.
+A Steam file integrity check is not needed for this cleanup: no original
+Retail file is modified. The script verifies the SHA-256 of `FEAR.exe` before
+and after.
 
 SteamVR should be closed during uninstall: it rewrites its configuration on
 shutdown and would otherwise overwrite the restoration. The script warns if
@@ -572,13 +581,14 @@ it sees SteamVR running.
 
 ## Known Limitations
 
-- The classic D3D9 path still requires a CPU readback per eye and frame
-  (`FEARVR_BF_CPU_FALLBACK`). F.E.A.R. creates a plain `IDirect3DDevice9`, and
-  D3D9 can only share surfaces across processes from a D3D9Ex device — so this
-  is the one remaining copy. The zero-copy `DirectShared` path already exists
-  and engages the moment the device is an Ex device; getting there needs a
-  wrapper for textures and buffers, because `D3DPOOL_MANAGED` does not exist on
-  Ex devices. **The stereo HUD compositor no longer reads back**: the pixel
+- Retail uses classic D3D9 with the CPU transfer path by default. The
+  experimental `tools\play.ps1 -D3D9Ex` mode can enable zero-copy
+  `DirectShared`, but the confirmed Steam 1.08 build rendered black and this
+  integration has not yet been revalidated in Retail. Managed index buffers
+  preserve their classic descriptor, binding identity, and reset contents;
+  other managed resources currently receive only D3D9Ex pool/usage
+  translation. D3D9Ex therefore remains opt-in.
+- **The stereo HUD compositor no longer reads back**: the pixel
   comparison runs as a `ps_2_0` shader on the GPU, and its coverage heuristic
   reads a few kilobytes one frame late instead of a full frame. That removed
   one of three readbacks and all per-pixel CPU work. `-fearvr-no-gpu-hud`

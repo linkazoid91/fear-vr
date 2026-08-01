@@ -1,6 +1,7 @@
 #include "bridge.h"
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -9,8 +10,10 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <Shellapi.h>
 #include <d3dcompiler.h>
@@ -18,6 +21,7 @@
 #include <MinHook.h>
 #include <wrl/client.h>
 
+#include "d3d9ex_compat.h"
 #include "fearvr-version.h"
 #include "ipc_names.h"
 #include "protocol_utils.h"
@@ -1126,7 +1130,9 @@ public:
         }
     }
 
-    void CapturePresent(IDirect3DDevice9* device) noexcept {
+    void CapturePresent(
+        IDirect3DDevice9* device,
+        IDirect3DSurface9* presentedBackBuffer = nullptr) noexcept {
         if (device == nullptr || config_.sessionId == 0) {
             return;
         }
@@ -1174,9 +1180,15 @@ public:
         }
 
         ComPtr<IDirect3DSurface9> backBuffer;
-        HRESULT result = device->GetBackBuffer(
-            0, 0, D3DBACKBUFFER_TYPE_MONO,
-            backBuffer.ReleaseAndGetAddressOf());
+        HRESULT result = D3D_OK;
+        if (presentedBackBuffer != nullptr) {
+            presentedBackBuffer->AddRef();
+            backBuffer.Attach(presentedBackBuffer);
+        } else {
+            result = device->GetBackBuffer(
+                0, 0, D3DBACKBUFFER_TYPE_MONO,
+                backBuffer.ReleaseAndGetAddressOf());
+        }
         if (FAILED(result)) {
             if (result == D3DERR_DEVICELOST) {
                 InterlockedOr(AtomicFlags(*shared_), FEARVR_BF_DEVICE_LOST);
@@ -3698,9 +3710,9 @@ private:
 };
 
 Bridge& GetBridge() {
-    // Absichtlich prozesslebenslang: CRT-Destruktoren laufen bei DLL_DETACH
-    // unter dem Loader-Lock. D3D/IPC-Cleanup darf dort nicht stattfinden;
-    // Windows gibt die Prozessressourcen beim Prozessende frei.
+    // Intentionally process-lifetime: CRT destructors run under the loader
+    // lock during DLL_DETACH, where D3D and IPC cleanup is unsafe. Windows
+    // releases the process resources when the process exits.
     static Bridge* bridge = new Bridge;
     return *bridge;
 }
@@ -3711,12 +3723,47 @@ using CreateDeviceFunction = HRESULT(STDMETHODCALLTYPE*)(
 using CreateDeviceExFunction = HRESULT(STDMETHODCALLTYPE*)(
     IDirect3D9Ex*, UINT, D3DDEVTYPE, HWND, DWORD,
     D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*, IDirect3DDevice9Ex**);
+using CreateAdditionalSwapChainFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, D3DPRESENT_PARAMETERS*, IDirect3DSwapChain9**);
+using GetSwapChainFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, IDirect3DSwapChain9**);
+using DeviceAddRefFunction = ULONG(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*);
+using DeviceReleaseFunction = ULONG(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*);
+using CreateTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+    IDirect3DTexture9**, HANDLE*);
+using CreateVolumeTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT,
+    D3DPOOL, IDirect3DVolumeTexture9**, HANDLE*);
+using CreateCubeTextureFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+    IDirect3DCubeTexture9**, HANDLE*);
+using CreateVertexBufferFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, DWORD, DWORD, D3DPOOL,
+    IDirect3DVertexBuffer9**, HANDLE*);
+using CreateIndexBufferFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, UINT, DWORD, D3DFORMAT, D3DPOOL,
+    IDirect3DIndexBuffer9**, HANDLE*);
 using ResetFunction =
     HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*,
                                 D3DPRESENT_PARAMETERS*);
 using PresentFunction =
     HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*,
                                 const RECT*, HWND, const RGNDATA*);
+using SwapChainPresentFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DSwapChain9*, const RECT*, const RECT*, HWND,
+    const RGNDATA*, DWORD);
+using ResetExFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9Ex*, D3DPRESENT_PARAMETERS*, D3DDISPLAYMODEEX*);
+using PresentExFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9Ex*, const RECT*, const RECT*, HWND,
+    const RGNDATA*, DWORD);
+using SetIndicesFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, IDirect3DIndexBuffer9*);
+using GetIndicesFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDirect3DDevice9*, IDirect3DIndexBuffer9**);
 using SetViewportFunction =
     HRESULT(STDMETHODCALLTYPE*)(
         IDirect3DDevice9*, const D3DVIEWPORT9*);
@@ -3733,26 +3780,824 @@ struct D3D9VtableRecord {
     void** vtable{nullptr};
     CreateDeviceFunction createDevice{nullptr};
     CreateDeviceExFunction createDeviceEx{nullptr};
+    bool createDeviceHookActive{false};
+    bool createDeviceExHookActive{false};
 };
 
 struct DeviceVtableRecord {
     void** vtable{nullptr};
+    DeviceAddRefFunction addRef{nullptr};
+    DeviceReleaseFunction release{nullptr};
+    CreateAdditionalSwapChainFunction createAdditionalSwapChain{nullptr};
+    GetSwapChainFunction getSwapChain{nullptr};
+    CreateTextureFunction createTexture{nullptr};
+    CreateVolumeTextureFunction createVolumeTexture{nullptr};
+    CreateCubeTextureFunction createCubeTexture{nullptr};
+    CreateVertexBufferFunction createVertexBuffer{nullptr};
+    CreateIndexBufferFunction createIndexBuffer{nullptr};
     ResetFunction reset{nullptr};
     PresentFunction present{nullptr};
+    ResetExFunction resetEx{nullptr};
+    PresentExFunction presentEx{nullptr};
     SetViewportFunction setViewport{nullptr};
     SetScissorRectFunction setScissorRect{nullptr};
+    bool baseHooksActive{false};
+    bool managedResourceHooksActive{false};
+    bool exHooksActive{false};
+};
+
+struct SwapChainVtableRecord {
+    void** vtable{nullptr};
+    SwapChainPresentFunction present{nullptr};
 };
 
 SRWLOCK g_hookLock = SRWLOCK_INIT;
+SRWLOCK g_appLocalHookLock = SRWLOCK_INIT;
+volatile LONG g_appLocalHooksActive = FALSE;
+volatile LONG g_appLocalHooksPoisoned = FALSE;
 std::array<D3D9VtableRecord, 8> g_d3d9Records{};
 std::array<DeviceVtableRecord, 8> g_deviceRecords{};
+std::array<SwapChainVtableRecord, 8> g_swapChainRecords{};
 INIT_ONCE g_lateHookOnce = INIT_ONCE_STATIC_INIT;
 volatile LONG g_lateHooksActive = FALSE;
 BOOL g_lateHookResult = FALSE;
 ResetFunction g_lateReset = nullptr;
 PresentFunction g_latePresent = nullptr;
+ResetFunction g_appLocalReset = nullptr;
+PresentFunction g_appLocalPresent = nullptr;
+SetIndicesFunction g_appLocalSetIndices = nullptr;
+GetIndicesFunction g_appLocalGetIndices = nullptr;
+void* g_appLocalResetTarget = nullptr;
+void* g_appLocalPresentTarget = nullptr;
+void* g_appLocalSetIndicesTarget = nullptr;
+void* g_appLocalGetIndicesTarget = nullptr;
 SetViewportFunction g_lateSetViewport = nullptr;
 SetScissorRectFunction g_lateSetScissorRect = nullptr;
+volatile LONG g_managedResourceTranslationLogged = FALSE;
+volatile LONG g_managedIndexCreateDetailsLogged = FALSE;
+volatile LONG g_managedIndexLockLogged = FALSE;
+volatile LONG g_swapChainHookLogged = FALSE;
+alignas(8) volatile LONG64 g_presentHookCounts[3]{};
+LONG g_managedResourceSuccessLogged[5]{};
+bool TranslateManagedResource(
+    DWORD& usage, D3DPOOL& pool,
+    bool requiresDynamicLocking) noexcept {
+    if (pool != D3DPOOL_MANAGED) {
+        return false;
+    }
+    pool = D3DPOOL_DEFAULT;
+    if (requiresDynamicLocking) {
+        usage |= D3DUSAGE_DYNAMIC;
+    }
+    if (InterlockedCompareExchange(
+            &g_managedResourceTranslationLogged, TRUE, FALSE) == FALSE) {
+        GetBridge().LogHookStatus(
+            "INFO", "d3d9ex_managed_translation",
+            "D3DPOOL_MANAGED resources use persistent D3D9Ex "
+            "allocations; textures remain dynamically lockable while "
+            "static vertex/index buffers retain their original usage.");
+    }
+    return true;
+}
+
+// D3D9Ex rejects D3DPOOL_MANAGED, but Jupiter EX queries the descriptor of
+// its persistent UI index buffer and relies on the pool identity it requested.
+// Keep the real allocation in D3DPOOL_DEFAULT while presenting the classic
+// descriptor to the game. The device hook unwraps this private interface
+// before forwarding SetIndices to the D3D9Ex runtime.
+constexpr GUID kManagedIndexBufferInner = {
+    0xc102956e, 0xe31a, 0x4adc,
+    {0x89, 0xbb, 0x4f, 0x7d, 0x59, 0xe4, 0x63, 0x2a}};
+
+class ManagedIndexBufferCompat;
+SRWLOCK g_managedIndexRegistryLock = SRWLOCK_INIT;
+constexpr std::size_t kManagedIndexBufferCapacity = 4096;
+std::array<ManagedIndexBufferCompat*, kManagedIndexBufferCapacity>
+    g_managedIndexBuffers{};
+struct BoundManagedIndexBuffer {
+    IDirect3DDevice9* device{nullptr};
+    ManagedIndexBufferCompat* buffer{nullptr};
+};
+SRWLOCK g_boundManagedIndexLock = SRWLOCK_INIT;
+std::recursive_mutex g_managedIndexBindingCallMutex;
+std::array<BoundManagedIndexBuffer, 64>
+    g_boundManagedIndexBuffers{};
+volatile LONG g_nextManagedIndexDebugId = 0;
+volatile LONG g_managedIndexLifecycleSequence = 0;
+
+class ManagedIndexBufferCompat final : public IDirect3DIndexBuffer9 {
+public:
+    ManagedIndexBufferCompat(
+        IDirect3DIndexBuffer9* inner,
+        DWORD requestedUsage, D3DFORMAT format,
+        UINT length)
+        : inner_(inner),
+          debugId_(InterlockedIncrement(
+              &g_nextManagedIndexDebugId)) {
+        description_.Format = format;
+        description_.Type = D3DRTYPE_INDEXBUFFER;
+        description_.Usage = requestedUsage;
+        description_.Pool = D3DPOOL_MANAGED;
+        description_.Size = length;
+        shadow_.resize(length);
+        bool registered = false;
+        AcquireSRWLockExclusive(&g_managedIndexRegistryLock);
+        for (auto& buffer : g_managedIndexBuffers) {
+            if (buffer == nullptr) {
+                buffer = this;
+                registered = true;
+                registered_ = true;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_managedIndexRegistryLock);
+        std::ostringstream message;
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " wrapper=0x" << std::hex
+                << reinterpret_cast<std::uintptr_t>(this)
+                << " inner=0x"
+                << reinterpret_cast<std::uintptr_t>(inner_)
+                << std::dec << " length=" << length
+                << " registered=" << (registered ? 1 : 0);
+        GetBridge().LogHookStatus(
+            registered ? "INFO" : "ERROR",
+            "d3d9ex_managed_index_lifecycle_create",
+            message.str());
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+        REFIID interfaceId, void** output) override {
+        if (output == nullptr) {
+            return E_POINTER;
+        }
+        *output = nullptr;
+        if (interfaceId == __uuidof(IUnknown) ||
+            interfaceId == __uuidof(IDirect3DResource9) ||
+            interfaceId == __uuidof(IDirect3DIndexBuffer9)) {
+            *output = static_cast<IDirect3DIndexBuffer9*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (interfaceId == kManagedIndexBufferInner) {
+            *output = inner_;
+            inner_->AddRef();
+            const LONG ordinal = InterlockedIncrement(
+                &innerQueryCount_);
+            if (ordinal <= 8) {
+                std::ostringstream message;
+                message << "sequence="
+                        << InterlockedIncrement(
+                               &g_managedIndexLifecycleSequence)
+                        << " id=" << debugId_
+                        << " ordinal=" << ordinal;
+                GetBridge().LogHookStatus(
+                    "INFO",
+                    "d3d9ex_managed_index_lifecycle_unwrap",
+                    message.str());
+            }
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return AddReference("add_ref");
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        return ReleaseReference("release");
+    }
+
+    ULONG RetainForSnapshot() noexcept {
+        return AddReference("snapshot_add_ref");
+    }
+
+    ULONG ReleaseFromSnapshot() noexcept {
+        return ReleaseReference("snapshot_release");
+    }
+
+    ULONG RetainForBinding() noexcept {
+        return AddReference("binding_add_ref");
+    }
+
+    ULONG ReleaseFromBinding() noexcept {
+        return ReleaseReference("binding_release");
+    }
+
+    IDirect3DIndexBuffer9* Inner() const noexcept {
+        return inner_;
+    }
+
+    bool Registered() const noexcept {
+        return registered_;
+    }
+
+    void QuarantineAfterDeviceLoss() noexcept {
+        AcquireSRWLockExclusive(&g_managedIndexRegistryLock);
+        for (auto& buffer : g_managedIndexBuffers) {
+            if (buffer == this) {
+                buffer = nullptr;
+                break;
+            }
+        }
+        registered_ = false;
+        ReleaseSRWLockExclusive(&g_managedIndexRegistryLock);
+        LogLifecycleState("quarantined_after_device_loss", E_UNEXPECTED);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDevice(
+        IDirect3DDevice9** device) override {
+        return inner_->GetDevice(device);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetPrivateData(
+        REFGUID guid, const void* data, DWORD size,
+        DWORD flags) override {
+        return inner_->SetPrivateData(guid, data, size, flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPrivateData(
+        REFGUID guid, void* data, DWORD* size) override {
+        return inner_->GetPrivateData(guid, data, size);
+    }
+
+    HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID guid) override {
+        return inner_->FreePrivateData(guid);
+    }
+
+    DWORD STDMETHODCALLTYPE SetPriority(DWORD priority) override {
+        return inner_->SetPriority(priority);
+    }
+
+    DWORD STDMETHODCALLTYPE GetPriority() override {
+        return inner_->GetPriority();
+    }
+
+    void STDMETHODCALLTYPE PreLoad() override {
+        inner_->PreLoad();
+    }
+
+    D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override {
+        return D3DRTYPE_INDEXBUFFER;
+    }
+
+    HRESULT STDMETHODCALLTYPE Lock(
+        UINT offset, UINT size, void** data, DWORD flags) override {
+        // If the application never delivered the Unlock that belonged to a
+        // pre-reset Lock, do not let the stale suppression consume a future,
+        // unrelated Unlock.
+        suppressNextUnlock_ = false;
+        const HRESULT result =
+            inner_->Lock(offset, size, data, flags);
+        const bool dataReturned =
+            SUCCEEDED(result) && data != nullptr && *data != nullptr;
+        if (dataReturned && offset <= shadow_.size()) {
+            lockedOffset_ = offset;
+            lockedSize_ = size != 0
+                ? (std::min)(
+                    static_cast<std::size_t>(size),
+                    shadow_.size() - offset)
+                : shadow_.size() - offset;
+            lockedData_ = *data;
+            if (InterlockedCompareExchange(
+                    &g_managedIndexLockLogged,
+                    TRUE, FALSE) == FALSE) {
+                std::ostringstream message;
+                message << "offset=" << offset
+                        << " size=" << size
+                        << " flags=0x" << std::hex << flags
+                        << std::dec << " data=1";
+                GetBridge().LogHookStatus(
+                    "INFO", "d3d9ex_managed_index_lock",
+                    message.str());
+            }
+        } else if (SUCCEEDED(result)) {
+            lockedData_ = nullptr;
+            lockedOffset_ = 0;
+            lockedSize_ = 0;
+        }
+        const LONG ordinal = InterlockedIncrement(&lockLogCount_);
+        if (ordinal <= 8 || FAILED(result)) {
+            std::ostringstream message;
+            message << "sequence="
+                    << InterlockedIncrement(
+                           &g_managedIndexLifecycleSequence)
+                    << " id=" << debugId_
+                    << " ordinal=" << ordinal
+                    << " offset=" << offset
+                    << " size=" << size
+                    << " flags=0x" << std::hex << flags
+                    << " HRESULT=0x"
+                    << static_cast<std::uint32_t>(result)
+                    << std::dec << " data="
+                    << (dataReturned ? 1 : 0)
+                    << " tracked_lock="
+                    << (lockedData_ != nullptr ? 1 : 0);
+            GetBridge().LogHookStatus(
+                SUCCEEDED(result) ? "INFO" : "ERROR",
+                "d3d9ex_managed_index_lifecycle_lock",
+                message.str());
+        }
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE Unlock() override {
+        if (suppressNextUnlock_) {
+            suppressNextUnlock_ = false;
+            LogUnlockLifecycle(D3D_OK, true);
+            return D3D_OK;
+        }
+        if (lockedData_ != nullptr && lockedSize_ != 0) {
+            std::memcpy(
+                shadow_.data() + lockedOffset_,
+                lockedData_, lockedSize_);
+            shadowReady_ = true;
+        }
+        lockedData_ = nullptr;
+        lockedOffset_ = 0;
+        lockedSize_ = 0;
+        const HRESULT result = inner_->Unlock();
+        LogUnlockLifecycle(result, false);
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc(
+        D3DINDEXBUFFER_DESC* description) override {
+        if (description == nullptr) {
+            return D3DERR_INVALIDCALL;
+        }
+        *description = description_;
+        return D3D_OK;
+    }
+
+    HRESULT RestoreAfterReset() noexcept {
+        if (!shadowReady_ || shadow_.empty()) {
+            return S_FALSE;
+        }
+        void* destination = nullptr;
+        HRESULT result = inner_->Lock(
+            0, static_cast<UINT>(shadow_.size()),
+            &destination, 0);
+        if (FAILED(result) || destination == nullptr) {
+            return FAILED(result) ? result : E_POINTER;
+        }
+        std::memcpy(
+            destination, shadow_.data(), shadow_.size());
+        result = inner_->Unlock();
+        return result;
+    }
+
+    HRESULT PrepareForReset() noexcept {
+        if (lockedData_ == nullptr) {
+            return S_FALSE;
+        }
+        if (lockedSize_ != 0) {
+            std::memcpy(
+                shadow_.data() + lockedOffset_,
+                lockedData_, lockedSize_);
+            shadowReady_ = true;
+        }
+        lockedData_ = nullptr;
+        lockedOffset_ = 0;
+        lockedSize_ = 0;
+        const HRESULT result = inner_->Unlock();
+        if (SUCCEEDED(result)) {
+            suppressNextUnlock_ = true;
+        }
+        return result;
+    }
+
+    LONG DebugId() const noexcept {
+        return debugId_;
+    }
+
+    bool IsLocked() const noexcept {
+        return lockedData_ != nullptr;
+    }
+
+    bool HasShadow() const noexcept {
+        return shadowReady_;
+    }
+
+    void LogSetIndicesLifecycle(
+        HRESULT result, bool unwrapped) noexcept {
+        const LONG ordinal = InterlockedIncrement(&setIndicesCount_);
+        if (ordinal > 8 && SUCCEEDED(result)) {
+            return;
+        }
+        std::ostringstream message;
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " ordinal=" << ordinal
+                << " unwrapped=" << (unwrapped ? 1 : 0)
+                << " HRESULT=0x" << std::hex << std::uppercase
+                << static_cast<std::uint32_t>(result);
+        GetBridge().LogHookStatus(
+            SUCCEEDED(result) && unwrapped ? "INFO" : "ERROR",
+            "d3d9ex_managed_index_lifecycle_set_indices",
+            message.str());
+    }
+
+    void LogResetSnapshot(
+        const char* phase, HRESULT result) noexcept {
+        LogLifecycleState(phase, result);
+    }
+
+private:
+    ULONG AddReference(const char* operation) noexcept {
+        const LONG remaining = InterlockedIncrement(&references_);
+        const LONG ordinal = InterlockedIncrement(&addRefCount_);
+        LogReferenceLifecycle(
+            operation, ordinal, remaining, false);
+        return static_cast<ULONG>(remaining);
+    }
+
+    ULONG ReleaseReference(const char* operation) noexcept {
+        AcquireSRWLockExclusive(&g_managedIndexRegistryLock);
+        const LONG remaining = InterlockedDecrement(&references_);
+        if (remaining == 0) {
+            for (auto& buffer : g_managedIndexBuffers) {
+                if (buffer == this) {
+                    buffer = nullptr;
+                    break;
+                }
+            }
+        }
+        ReleaseSRWLockExclusive(&g_managedIndexRegistryLock);
+        const LONG ordinal = InterlockedIncrement(&releaseCount_);
+        LogReferenceLifecycle(
+            operation, ordinal, remaining, remaining == 0);
+        if (remaining == 0) {
+            delete this;
+            return 0;
+        }
+        return static_cast<ULONG>(remaining);
+    }
+
+    void LogReferenceLifecycle(
+        const char* operation, LONG ordinal, LONG remaining,
+        bool force) noexcept {
+        if (!force && ordinal > 16) {
+            return;
+        }
+        std::ostringstream message;
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " operation=" << operation
+                << " ordinal=" << ordinal
+                << " references=" << remaining;
+        GetBridge().LogHookStatus(
+            remaining >= 0 ? "INFO" : "ERROR",
+            "d3d9ex_managed_index_lifecycle_reference",
+            message.str());
+    }
+
+    void LogLifecycleState(
+        const char* phase, HRESULT result) noexcept {
+        std::ostringstream message;
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " phase=" << phase
+                << " references="
+                << InterlockedCompareExchange(&references_, 0, 0)
+                << " locks="
+                << InterlockedCompareExchange(&lockLogCount_, 0, 0)
+                << " unlocks="
+                << InterlockedCompareExchange(&unlockLogCount_, 0, 0)
+                << " set_indices="
+                << InterlockedCompareExchange(&setIndicesCount_, 0, 0)
+                << " unwraps="
+                << InterlockedCompareExchange(&innerQueryCount_, 0, 0)
+                << " add_refs="
+                << InterlockedCompareExchange(&addRefCount_, 0, 0)
+                << " releases="
+                << InterlockedCompareExchange(&releaseCount_, 0, 0)
+                << " locked=" << (lockedData_ != nullptr ? 1 : 0)
+                << " shadow_ready=" << (shadowReady_ ? 1 : 0)
+                << " suppress_unlock="
+                << (suppressNextUnlock_ ? 1 : 0)
+                << " HRESULT=0x" << std::hex << std::uppercase
+                << static_cast<std::uint32_t>(result);
+        GetBridge().LogHookStatus(
+            FAILED(result) ? "ERROR" : "INFO",
+            "d3d9ex_managed_index_lifecycle_state",
+            message.str());
+    }
+
+    void LogUnlockLifecycle(
+        HRESULT result, bool suppressed) noexcept {
+        const LONG ordinal = InterlockedIncrement(&unlockLogCount_);
+        if (ordinal > 8 && SUCCEEDED(result)) {
+            return;
+        }
+        std::ostringstream message;
+        message << "sequence="
+                << InterlockedIncrement(
+                       &g_managedIndexLifecycleSequence)
+                << " id=" << debugId_
+                << " ordinal=" << ordinal
+                << " HRESULT=0x" << std::hex
+                << static_cast<std::uint32_t>(result)
+                << std::dec << " shadow_ready="
+                << (shadowReady_ ? 1 : 0)
+                << " suppressed=" << (suppressed ? 1 : 0);
+        GetBridge().LogHookStatus(
+            SUCCEEDED(result) ? "INFO" : "ERROR",
+            "d3d9ex_managed_index_lifecycle_unlock",
+            message.str());
+    }
+
+    ~ManagedIndexBufferCompat() {
+        LogLifecycleState("destroy", S_OK);
+        inner_->Release();
+    }
+
+    volatile LONG references_{1};
+    IDirect3DIndexBuffer9* inner_{nullptr};
+    LONG debugId_{0};
+    D3DINDEXBUFFER_DESC description_{};
+    std::vector<std::uint8_t> shadow_;
+    void* lockedData_{nullptr};
+    std::size_t lockedOffset_{0};
+    std::size_t lockedSize_{0};
+    bool shadowReady_{false};
+    bool suppressNextUnlock_{false};
+    bool registered_{false};
+    volatile LONG lockLogCount_{0};
+    volatile LONG unlockLogCount_{0};
+    volatile LONG setIndicesCount_{0};
+    volatile LONG innerQueryCount_{0};
+    volatile LONG addRefCount_{0};
+    volatile LONG releaseCount_{0};
+};
+
+ManagedIndexBufferCompat* RetainManagedIndexBufferForBinding(
+    IDirect3DIndexBuffer9* indexBuffer) noexcept {
+    if (indexBuffer == nullptr) {
+        return nullptr;
+    }
+    ManagedIndexBufferCompat* result = nullptr;
+    AcquireSRWLockShared(&g_managedIndexRegistryLock);
+    for (ManagedIndexBufferCompat* buffer : g_managedIndexBuffers) {
+        if (static_cast<IDirect3DIndexBuffer9*>(buffer) == indexBuffer) {
+            buffer->RetainForBinding();
+            result = buffer;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_managedIndexRegistryLock);
+    return result;
+}
+
+ManagedIndexBufferCompat* RetainManagedIndexBufferByInner(
+    IDirect3DIndexBuffer9* inner) noexcept {
+    if (inner == nullptr) {
+        return nullptr;
+    }
+    ManagedIndexBufferCompat* result = nullptr;
+    AcquireSRWLockShared(&g_managedIndexRegistryLock);
+    for (ManagedIndexBufferCompat* buffer : g_managedIndexBuffers) {
+        if (buffer != nullptr && buffer->Inner() == inner) {
+            buffer->AddRef();
+            result = buffer;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_managedIndexRegistryLock);
+    return result;
+}
+
+bool CanTrackBoundManagedIndexBuffer(
+    IDirect3DDevice9* device,
+    ManagedIndexBufferCompat* retainedBuffer) noexcept {
+    if (device == nullptr || retainedBuffer == nullptr) {
+        return true;
+    }
+    bool canTrack = false;
+    AcquireSRWLockShared(&g_boundManagedIndexLock);
+    for (const BoundManagedIndexBuffer& record :
+         g_boundManagedIndexBuffers) {
+        if (record.device == device || record.device == nullptr) {
+            canTrack = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_boundManagedIndexLock);
+    return canTrack;
+}
+
+ManagedIndexBufferCompat* TakeBoundManagedIndexBuffer(
+    IDirect3DDevice9* device) noexcept {
+    if (device == nullptr) {
+        return nullptr;
+    }
+    ManagedIndexBufferCompat* retainedBuffer = nullptr;
+    AcquireSRWLockExclusive(&g_boundManagedIndexLock);
+    for (BoundManagedIndexBuffer& record : g_boundManagedIndexBuffers) {
+        if (record.device == device) {
+            retainedBuffer = record.buffer;
+            record = {};
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_boundManagedIndexLock);
+    return retainedBuffer;
+}
+
+void ReplaceBoundManagedIndexBufferLocked(
+    IDirect3DDevice9* device,
+    ManagedIndexBufferCompat* retainedBuffer) noexcept {
+    if (device == nullptr) {
+        if (retainedBuffer != nullptr) {
+            retainedBuffer->ReleaseFromBinding();
+        }
+        return;
+    }
+
+    BoundManagedIndexBuffer* selected = nullptr;
+    BoundManagedIndexBuffer* empty = nullptr;
+    ManagedIndexBufferCompat* previous = nullptr;
+    AcquireSRWLockExclusive(&g_boundManagedIndexLock);
+    for (BoundManagedIndexBuffer& record : g_boundManagedIndexBuffers) {
+        if (record.device == device) {
+            selected = &record;
+            break;
+        }
+        if (empty == nullptr && record.device == nullptr) {
+            empty = &record;
+        }
+    }
+    if (selected == nullptr && retainedBuffer != nullptr) {
+        selected = empty;
+    }
+    if (selected != nullptr) {
+        previous = selected->buffer;
+        if (retainedBuffer == nullptr) {
+            *selected = {};
+        } else {
+            selected->device = device;
+            selected->buffer = retainedBuffer;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_boundManagedIndexLock);
+
+    if (previous != nullptr) {
+        previous->ReleaseFromBinding();
+    }
+    if (retainedBuffer != nullptr && selected == nullptr) {
+        retainedBuffer->ReleaseFromBinding();
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9ex_bound_index_registry_full",
+            "A managed index binding could not be tracked because the "
+            "per-device binding table is full.");
+    }
+}
+
+void ReplaceBoundManagedIndexBuffer(
+    IDirect3DDevice9* device,
+    ManagedIndexBufferCompat* retainedBuffer) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(
+        g_managedIndexBindingCallMutex);
+    ReplaceBoundManagedIndexBufferLocked(device, retainedBuffer);
+}
+
+void LogManagedIndexSetIndicesLifecycle(
+    IDirect3DIndexBuffer9* indexBuffer, HRESULT result,
+    bool unwrapped) noexcept {
+    if (indexBuffer == nullptr) {
+        return;
+    }
+    AcquireSRWLockShared(&g_managedIndexRegistryLock);
+    for (ManagedIndexBufferCompat* buffer : g_managedIndexBuffers) {
+        if (static_cast<IDirect3DIndexBuffer9*>(buffer) == indexBuffer) {
+            buffer->LogSetIndicesLifecycle(result, unwrapped);
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_managedIndexRegistryLock);
+}
+
+void PrepareManagedIndexBuffersForReset() noexcept {
+    std::array<
+        ManagedIndexBufferCompat*, kManagedIndexBufferCapacity> buffers{};
+    AcquireSRWLockShared(&g_managedIndexRegistryLock);
+    for (std::size_t index = 0;
+         index < g_managedIndexBuffers.size(); ++index) {
+        buffers[index] = g_managedIndexBuffers[index];
+        if (buffers[index] != nullptr) {
+            buffers[index]->RetainForSnapshot();
+        }
+    }
+    ReleaseSRWLockShared(&g_managedIndexRegistryLock);
+
+    UINT prepared = 0;
+    UINT registered = 0;
+    UINT locked = 0;
+    UINT shadowed = 0;
+    HRESULT failure = S_OK;
+    for (ManagedIndexBufferCompat* buffer : buffers) {
+        if (buffer == nullptr) {
+            continue;
+        }
+        ++registered;
+        locked += buffer->IsLocked() ? 1U : 0U;
+        shadowed += buffer->HasShadow() ? 1U : 0U;
+        buffer->LogResetSnapshot("before_prepare", S_OK);
+        const HRESULT result = buffer->PrepareForReset();
+        buffer->LogResetSnapshot("after_prepare", result);
+        if (result == S_OK) {
+            ++prepared;
+        } else if (FAILED(result) && SUCCEEDED(failure)) {
+            failure = result;
+        }
+        buffer->ReleaseFromSnapshot();
+    }
+    std::ostringstream message;
+    message << "registered=" << registered
+            << " locked=" << locked
+            << " shadowed=" << shadowed
+            << " prepared=" << prepared << " HRESULT=0x"
+            << std::hex << std::uppercase
+            << static_cast<std::uint32_t>(failure);
+    GetBridge().LogHookStatus(
+        FAILED(failure) ? "ERROR" : "INFO",
+        "d3d9ex_managed_prepare_reset", message.str());
+}
+
+void RestoreManagedIndexBuffersAfterReset() noexcept {
+    std::array<
+        ManagedIndexBufferCompat*, kManagedIndexBufferCapacity> buffers{};
+    AcquireSRWLockShared(&g_managedIndexRegistryLock);
+    for (std::size_t index = 0;
+         index < g_managedIndexBuffers.size(); ++index) {
+        buffers[index] = g_managedIndexBuffers[index];
+        if (buffers[index] != nullptr) {
+            buffers[index]->RetainForSnapshot();
+        }
+    }
+    ReleaseSRWLockShared(&g_managedIndexRegistryLock);
+
+    UINT restored = 0;
+    UINT registered = 0;
+    UINT shadowed = 0;
+    HRESULT failure = S_OK;
+    for (ManagedIndexBufferCompat* buffer : buffers) {
+        if (buffer == nullptr) {
+            continue;
+        }
+        ++registered;
+        shadowed += buffer->HasShadow() ? 1U : 0U;
+        buffer->LogResetSnapshot("before_restore", S_OK);
+        const HRESULT result = buffer->RestoreAfterReset();
+        buffer->LogResetSnapshot("after_restore", result);
+        if (result == S_OK) {
+            ++restored;
+        } else if (FAILED(result) && SUCCEEDED(failure)) {
+            failure = result;
+        }
+        buffer->ReleaseFromSnapshot();
+    }
+    std::ostringstream message;
+    message << "registered=" << registered
+            << " shadowed=" << shadowed
+            << " restored=" << restored << " HRESULT=0x"
+            << std::hex << std::uppercase
+            << static_cast<std::uint32_t>(failure);
+    GetBridge().LogHookStatus(
+        FAILED(failure) ? "ERROR" : "INFO",
+        "d3d9ex_managed_restore", message.str());
+}
+
+void LogManagedResourceResult(
+    std::size_t kindIndex, const char* kind, HRESULT result) noexcept {
+    if (FAILED(result)) {
+        std::ostringstream message;
+        message << "kind=" << kind << " HRESULT=0x"
+                << std::hex << std::uppercase
+                << static_cast<std::uint32_t>(result);
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9ex_managed_create_failed", message.str());
+        return;
+    }
+    if (kindIndex < 5 &&
+        InterlockedCompareExchange(
+            &g_managedResourceSuccessLogged[kindIndex],
+            TRUE, FALSE) == FALSE) {
+        GetBridge().LogHookStatus(
+            "INFO", "d3d9ex_managed_create",
+            std::string("kind=") + kind + " HRESULT=0x00000000");
+    }
+}
+
 
 HRESULT STDMETHODCALLTYPE HookCreateDevice(
     IDirect3D9* self, UINT adapter, D3DDEVTYPE deviceType,
@@ -3765,6 +4610,33 @@ HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(
     D3DPRESENT_PARAMETERS* parameters,
     D3DDISPLAYMODEEX* fullscreenMode,
     IDirect3DDevice9Ex** output);
+ULONG STDMETHODCALLTYPE HookDeviceRelease(IDirect3DDevice9* self);
+HRESULT STDMETHODCALLTYPE HookCreateAdditionalSwapChain(
+    IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters,
+    IDirect3DSwapChain9** output);
+HRESULT STDMETHODCALLTYPE HookGetSwapChain(
+    IDirect3DDevice9* self, UINT index,
+    IDirect3DSwapChain9** output);
+HRESULT STDMETHODCALLTYPE HookCreateTexture(
+    IDirect3DDevice9* self, UINT width, UINT height, UINT levels,
+    DWORD usage, D3DFORMAT format, D3DPOOL pool,
+    IDirect3DTexture9** output, HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateVolumeTexture(
+    IDirect3DDevice9* self, UINT width, UINT height, UINT depth,
+    UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+    IDirect3DVolumeTexture9** output, HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateCubeTexture(
+    IDirect3DDevice9* self, UINT edgeLength, UINT levels, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture9** output,
+    HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateVertexBuffer(
+    IDirect3DDevice9* self, UINT length, DWORD usage, DWORD fvf,
+    D3DPOOL pool, IDirect3DVertexBuffer9** output,
+    HANDLE* sharedHandle);
+HRESULT STDMETHODCALLTYPE HookCreateIndexBuffer(
+    IDirect3DDevice9* self, UINT length, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DIndexBuffer9** output,
+    HANDLE* sharedHandle);
 HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* self,
                                      D3DPRESENT_PARAMETERS* parameters);
 HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* self,
@@ -3772,6 +4644,28 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* self,
                                        const RECT* destination,
                                        HWND overrideWindow,
                                        const RGNDATA* dirtyRegion);
+HRESULT STDMETHODCALLTYPE HookResetEx(
+    IDirect3DDevice9Ex* self, D3DPRESENT_PARAMETERS* parameters,
+    D3DDISPLAYMODEEX* fullscreenMode);
+HRESULT STDMETHODCALLTYPE HookPresentEx(
+    IDirect3DDevice9Ex* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion, DWORD flags);
+HRESULT STDMETHODCALLTYPE HookSwapChainPresent(
+    IDirect3DSwapChain9* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion, DWORD flags);
+HRESULT STDMETHODCALLTYPE HookAppLocalReset(
+    IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters);
+HRESULT STDMETHODCALLTYPE HookAppLocalPresent(
+    IDirect3DDevice9* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion);
+HRESULT STDMETHODCALLTYPE HookAppLocalSetIndices(
+    IDirect3DDevice9* self, IDirect3DIndexBuffer9* indexBuffer);
+HRESULT STDMETHODCALLTYPE HookAppLocalGetIndices(
+    IDirect3DDevice9* self, IDirect3DIndexBuffer9** indexBuffer);
+
 HRESULT STDMETHODCALLTYPE HookSetViewport(
     IDirect3DDevice9* self, const D3DVIEWPORT9* viewport);
 HRESULT STDMETHODCALLTYPE HookSetScissorRect(
@@ -3803,79 +4697,462 @@ bool ReplaceVtableEntry(void** vtable, std::size_t index,
     return true;
 }
 
-void PatchDevice(IDirect3DDevice9* device) noexcept {
-    if (device == nullptr) {
-        return;
+bool InstallAppLocalCompatibilityHooks(
+    void* resetTarget, void* presentTarget,
+    void* setIndicesTarget, void* getIndicesTarget) noexcept {
+    if (resetTarget == nullptr || presentTarget == nullptr ||
+        setIndicesTarget == nullptr || getIndicesTarget == nullptr) {
+        return false;
     }
-    if (InterlockedCompareExchange(&g_lateHooksActive, FALSE, FALSE) !=
-        FALSE) {
-        return;
+
+    AcquireSRWLockExclusive(&g_appLocalHookLock);
+    if (InterlockedCompareExchange(
+            &g_appLocalHooksActive, FALSE, FALSE) != FALSE) {
+        const bool targetsMatch =
+            g_appLocalReset != nullptr &&
+            g_appLocalPresent != nullptr &&
+            g_appLocalSetIndices != nullptr &&
+            g_appLocalGetIndices != nullptr &&
+            g_appLocalResetTarget == resetTarget &&
+            g_appLocalPresentTarget == presentTarget &&
+            g_appLocalSetIndicesTarget == setIndicesTarget &&
+            g_appLocalGetIndicesTarget == getIndicesTarget;
+        ReleaseSRWLockExclusive(&g_appLocalHookLock);
+        if (!targetsMatch) {
+            GetBridge().LogHookStatus(
+                "ERROR", "app_local_hook_target_mismatch",
+                "The active compatibility detours belong to a different "
+                "D3D9 device implementation.");
+        }
+        return targetsMatch;
     }
-    void** vtable = *reinterpret_cast<void***>(device);
+    if (InterlockedCompareExchange(
+            &g_appLocalHooksPoisoned, FALSE, FALSE) != FALSE) {
+        ReleaseSRWLockExclusive(&g_appLocalHookLock);
+        GetBridge().LogHookStatus(
+            "ERROR", "app_local_hook_rollback_incomplete",
+            "A previous compatibility-detour rollback was incomplete; "
+            "another D3D9Ex device was rejected safely.");
+        return false;
+    }
+
+    g_appLocalResetTarget = resetTarget;
+    g_appLocalPresentTarget = presentTarget;
+    g_appLocalSetIndicesTarget = setIndicesTarget;
+    g_appLocalGetIndicesTarget = getIndicesTarget;
+
+    const auto clearState = [&]() {
+        g_appLocalReset = nullptr;
+        g_appLocalPresent = nullptr;
+        g_appLocalSetIndices = nullptr;
+        g_appLocalGetIndices = nullptr;
+        g_appLocalResetTarget = nullptr;
+        g_appLocalPresentTarget = nullptr;
+        g_appLocalSetIndicesTarget = nullptr;
+        g_appLocalGetIndicesTarget = nullptr;
+    };
+    const auto rollbackHook = [](void* target) {
+        const MH_STATUS disable = MH_DisableHook(target);
+        const bool disabled =
+            disable == MH_OK || disable == MH_ERROR_DISABLED ||
+            disable == MH_ERROR_NOT_CREATED;
+        const MH_STATUS remove = MH_RemoveHook(target);
+        const bool removed =
+            remove == MH_OK || remove == MH_ERROR_NOT_CREATED;
+        return disabled && removed;
+    };
+    const auto fail = [&](const char* event, MH_STATUS status,
+                          bool rollbackClean) {
+        InterlockedExchange(&g_appLocalHooksActive, FALSE);
+        InterlockedExchange(
+            &g_appLocalHooksPoisoned,
+            rollbackClean ? FALSE : TRUE);
+        if (rollbackClean) {
+            clearState();
+        }
+        ReleaseSRWLockExclusive(&g_appLocalHookLock);
+        std::string detail = MH_StatusToString(status);
+        if (!rollbackClean) {
+            detail += "; rollback incomplete, detours are pass-through";
+        }
+        GetBridge().LogHookStatus(
+            "ERROR", event, detail);
+        return false;
+    };
+
+    const MH_STATUS initialize = MH_Initialize();
+    if (initialize != MH_OK &&
+        initialize != MH_ERROR_ALREADY_INITIALIZED) {
+        return fail(
+            "app_local_hook_initialize_failed", initialize, true);
+    }
+
+    MH_STATUS status = MH_CreateHook(
+        resetTarget, reinterpret_cast<void*>(&HookAppLocalReset),
+        reinterpret_cast<void**>(&g_appLocalReset));
+    if (status != MH_OK) {
+        return fail("app_local_reset_hook_failed", status, true);
+    }
+    status = MH_CreateHook(
+        presentTarget, reinterpret_cast<void*>(&HookAppLocalPresent),
+        reinterpret_cast<void**>(&g_appLocalPresent));
+    if (status != MH_OK) {
+        const bool rollbackClean = rollbackHook(resetTarget);
+        return fail(
+            "app_local_present_hook_failed", status, rollbackClean);
+    }
+    status = MH_CreateHook(
+        setIndicesTarget,
+        reinterpret_cast<void*>(&HookAppLocalSetIndices),
+        reinterpret_cast<void**>(&g_appLocalSetIndices));
+    if (status != MH_OK) {
+        bool rollbackClean = rollbackHook(presentTarget);
+        rollbackClean = rollbackHook(resetTarget) && rollbackClean;
+        return fail(
+            "app_local_set_indices_hook_failed", status,
+            rollbackClean);
+    }
+    status = MH_CreateHook(
+        getIndicesTarget,
+        reinterpret_cast<void*>(&HookAppLocalGetIndices),
+        reinterpret_cast<void**>(&g_appLocalGetIndices));
+    if (status != MH_OK) {
+        bool rollbackClean = rollbackHook(setIndicesTarget);
+        rollbackClean = rollbackHook(presentTarget) && rollbackClean;
+        rollbackClean = rollbackHook(resetTarget) && rollbackClean;
+        return fail(
+            "app_local_get_indices_hook_failed", status,
+            rollbackClean);
+    }
+
+    status = MH_QueueEnableHook(resetTarget);
+    if (status == MH_OK) {
+        status = MH_QueueEnableHook(presentTarget);
+    }
+    if (status == MH_OK) {
+        status = MH_QueueEnableHook(setIndicesTarget);
+    }
+    if (status == MH_OK) {
+        status = MH_QueueEnableHook(getIndicesTarget);
+    }
+    if (status == MH_OK) {
+        status = MH_ApplyQueued();
+    }
+    if (status != MH_OK) {
+        bool rollbackClean = rollbackHook(getIndicesTarget);
+        rollbackClean = rollbackHook(setIndicesTarget) && rollbackClean;
+        rollbackClean = rollbackHook(presentTarget) && rollbackClean;
+        rollbackClean = rollbackHook(resetTarget) && rollbackClean;
+        return fail(
+            "app_local_hook_enable_failed", status, rollbackClean);
+    }
+
+    InterlockedExchange(&g_appLocalHooksPoisoned, FALSE);
+    InterlockedExchange(&g_appLocalHooksActive, TRUE);
+    ReleaseSRWLockExclusive(&g_appLocalHookLock);
+    GetBridge().LogHookStatus(
+        "INFO", "app_local_d3d9ex_hooks_active",
+        "Reset, Present, SetIndices, and GetIndices implementation hooks "
+        "are active for D3D9Ex compatibility.");
+    return true;
+}
+
+bool PatchSwapChain(IDirect3DSwapChain9* swapChain) noexcept {
+    if (swapChain == nullptr) {
+        return false;
+    }
+
+    void** vtable = *reinterpret_cast<void***>(swapChain);
+    bool patched = false;
     AcquireSRWLockExclusive(&g_hookLock);
-    for (const DeviceVtableRecord& record : g_deviceRecords) {
+    for (const SwapChainVtableRecord& record : g_swapChainRecords) {
         if (record.vtable == vtable) {
+            const bool active = record.present != nullptr;
             ReleaseSRWLockExclusive(&g_hookLock);
-            return;
+            return active;
         }
     }
+    for (SwapChainVtableRecord& record : g_swapChainRecords) {
+        if (record.vtable != nullptr) {
+            continue;
+        }
+        record.vtable = vtable;
+        record.present =
+            reinterpret_cast<SwapChainPresentFunction>(vtable[3]);
+        patched = ReplaceVtableEntry(
+            vtable, 3,
+            reinterpret_cast<void*>(&HookSwapChainPresent));
+        if (!patched) {
+            record = {};
+        }
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_hookLock);
+
+    if (patched &&
+        InterlockedCompareExchange(
+            &g_swapChainHookLogged, TRUE, FALSE) == FALSE) {
+        GetBridge().LogHookStatus(
+            "INFO", "swapchain_present_hooked",
+            "IDirect3DSwapChain9::Present capture is active.");
+    }
+    if (!patched) {
+        GetBridge().LogHookStatus(
+            "ERROR", "swapchain_present_hook_failed",
+            "IDirect3DSwapChain9::Present could not be intercepted safely.");
+    }
+    return patched;
+}
+
+bool PatchDevice(
+    IDirect3DDevice9* device, bool hasEx = false,
+    bool translateManagedResources = false) noexcept {
+    if (device == nullptr) {
+        return false;
+    }
+    const bool lateHooksActive =
+        InterlockedCompareExchange(
+            &g_lateHooksActive, FALSE, FALSE) != FALSE;
+    if (lateHooksActive) {
+        return !translateManagedResources;
+    }
+
+    void** vtable = *reinterpret_cast<void***>(device);
+    const bool implementationHooksActive =
+        translateManagedResources &&
+        InstallAppLocalCompatibilityHooks(
+            vtable[16], vtable[17], vtable[104], vtable[105]);
+    if (translateManagedResources && !implementationHooksActive) {
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9ex_required_hooks_missing",
+            "D3D9Ex compatibility was rejected because Reset, Present, "
+            "SetIndices, or GetIndices could not be intercepted safely.");
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&g_hookLock);
+    DeviceVtableRecord* selected = nullptr;
     for (DeviceVtableRecord& record : g_deviceRecords) {
-        if (record.vtable == nullptr) {
-            record.vtable = vtable;
-            record.reset =
-                reinterpret_cast<ResetFunction>(vtable[16]);
-            record.present =
-                reinterpret_cast<PresentFunction>(vtable[17]);
-            record.setViewport =
-                reinterpret_cast<SetViewportFunction>(vtable[47]);
-            record.setScissorRect =
-                reinterpret_cast<SetScissorRectFunction>(vtable[75]);
-            ReplaceVtableEntry(vtable, 16,
-                               reinterpret_cast<void*>(&HookReset));
-            ReplaceVtableEntry(vtable, 17,
-                               reinterpret_cast<void*>(&HookPresent));
-            ReplaceVtableEntry(
-                vtable, 47,
-                reinterpret_cast<void*>(&HookSetViewport));
-            ReplaceVtableEntry(
-                vtable, 75,
-                reinterpret_cast<void*>(&HookSetScissorRect));
+        if (record.vtable == vtable) {
+            selected = &record;
             break;
         }
     }
+    if (selected == nullptr) {
+        for (DeviceVtableRecord& record : g_deviceRecords) {
+            if (record.vtable != nullptr) {
+                continue;
+            }
+            selected = &record;
+            selected->vtable = vtable;
+            selected->addRef =
+                reinterpret_cast<DeviceAddRefFunction>(vtable[1]);
+            selected->release =
+                reinterpret_cast<DeviceReleaseFunction>(vtable[2]);
+            selected->createAdditionalSwapChain =
+                reinterpret_cast<CreateAdditionalSwapChainFunction>(
+                    vtable[13]);
+            selected->getSwapChain =
+                reinterpret_cast<GetSwapChainFunction>(vtable[14]);
+            selected->reset = implementationHooksActive
+                ? g_appLocalReset
+                : reinterpret_cast<ResetFunction>(vtable[16]);
+            selected->present = implementationHooksActive
+                ? g_appLocalPresent
+                : reinterpret_cast<PresentFunction>(vtable[17]);
+            selected->setViewport =
+                reinterpret_cast<SetViewportFunction>(vtable[47]);
+            selected->setScissorRect =
+                reinterpret_cast<SetScissorRectFunction>(vtable[75]);
+            bool baseHooksActive = true;
+            baseHooksActive = ReplaceVtableEntry(
+                vtable, 2,
+                reinterpret_cast<void*>(&HookDeviceRelease)) &&
+                baseHooksActive;
+            baseHooksActive = ReplaceVtableEntry(
+                vtable, 13,
+                reinterpret_cast<void*>(
+                    &HookCreateAdditionalSwapChain)) &&
+                baseHooksActive;
+            baseHooksActive = ReplaceVtableEntry(
+                vtable, 14,
+                reinterpret_cast<void*>(&HookGetSwapChain)) &&
+                baseHooksActive;
+            if (!implementationHooksActive) {
+                baseHooksActive = ReplaceVtableEntry(
+                    vtable, 16,
+                    reinterpret_cast<void*>(&HookReset)) &&
+                    baseHooksActive;
+                baseHooksActive = ReplaceVtableEntry(
+                    vtable, 17,
+                    reinterpret_cast<void*>(&HookPresent)) &&
+                    baseHooksActive;
+            }
+            baseHooksActive = ReplaceVtableEntry(
+                vtable, 47,
+                reinterpret_cast<void*>(&HookSetViewport)) &&
+                baseHooksActive;
+            baseHooksActive = ReplaceVtableEntry(
+                vtable, 75,
+                reinterpret_cast<void*>(&HookSetScissorRect)) &&
+                baseHooksActive;
+            selected->baseHooksActive = baseHooksActive;
+            break;
+        }
+    }
+
+    if (selected != nullptr && translateManagedResources &&
+        !selected->managedResourceHooksActive) {
+        if (selected->createTexture == nullptr) {
+            selected->createTexture =
+                reinterpret_cast<CreateTextureFunction>(vtable[23]);
+            selected->createVolumeTexture =
+                reinterpret_cast<CreateVolumeTextureFunction>(vtable[24]);
+            selected->createCubeTexture =
+                reinterpret_cast<CreateCubeTextureFunction>(vtable[25]);
+            selected->createVertexBuffer =
+                reinterpret_cast<CreateVertexBufferFunction>(vtable[26]);
+            selected->createIndexBuffer =
+                reinterpret_cast<CreateIndexBufferFunction>(vtable[27]);
+        }
+        bool resourceHooksActive = ReplaceVtableEntry(
+            vtable, 23,
+            reinterpret_cast<void*>(&HookCreateTexture));
+        resourceHooksActive = ReplaceVtableEntry(
+            vtable, 24,
+            reinterpret_cast<void*>(&HookCreateVolumeTexture)) &&
+            resourceHooksActive;
+        resourceHooksActive = ReplaceVtableEntry(
+            vtable, 25,
+            reinterpret_cast<void*>(&HookCreateCubeTexture)) &&
+            resourceHooksActive;
+        resourceHooksActive = ReplaceVtableEntry(
+            vtable, 26,
+            reinterpret_cast<void*>(&HookCreateVertexBuffer)) &&
+            resourceHooksActive;
+        resourceHooksActive = ReplaceVtableEntry(
+            vtable, 27,
+            reinterpret_cast<void*>(&HookCreateIndexBuffer)) &&
+            resourceHooksActive;
+        selected->managedResourceHooksActive = resourceHooksActive;
+    }
+
+    if (selected != nullptr && hasEx &&
+        !selected->exHooksActive) {
+        if (selected->presentEx == nullptr) {
+            selected->presentEx =
+                reinterpret_cast<PresentExFunction>(vtable[121]);
+            selected->resetEx =
+                reinterpret_cast<ResetExFunction>(vtable[132]);
+        }
+        bool exHooksActive = ReplaceVtableEntry(
+            vtable, 121,
+            reinterpret_cast<void*>(&HookPresentEx));
+        exHooksActive = ReplaceVtableEntry(
+            vtable, 132,
+            reinterpret_cast<void*>(&HookResetEx)) &&
+            exHooksActive;
+        selected->exHooksActive = exHooksActive;
+    }
+    const bool deviceRecorded = selected != nullptr;
+    const bool compatibilityReady =
+        deviceRecorded && selected->baseHooksActive &&
+        (!translateManagedResources ||
+         (selected->managedResourceHooksActive &&
+          (!hasEx || selected->exHooksActive)));
+    const bool baseHookFailure =
+        deviceRecorded && !selected->baseHooksActive;
+    const bool managedHookFailure =
+        deviceRecorded && translateManagedResources &&
+        !selected->managedResourceHooksActive;
+    const bool exHookFailure =
+        deviceRecorded && translateManagedResources && hasEx &&
+        !selected->exHooksActive;
     ReleaseSRWLockExclusive(&g_hookLock);
+
+    if (baseHookFailure || managedHookFailure || exHookFailure) {
+        std::string missing;
+        if (baseHookFailure) {
+            missing += "device release/swap-chain/viewport/scissor/present;";
+        }
+        if (managedHookFailure) {
+            missing += "managed-resource creation;";
+        }
+        if (exHookFailure) {
+            missing += "ResetEx/PresentEx;";
+        }
+        GetBridge().LogHookStatus(
+            translateManagedResources ? "ERROR" : "WARN",
+            "d3d9_vtable_patch_failed",
+            "Required device hooks could not be installed: " + missing);
+    }
+
+    bool defaultSwapChainReady = false;
+    IDirect3DSwapChain9* defaultSwapChain = nullptr;
+    if (deviceRecorded &&
+        SUCCEEDED(device->GetSwapChain(0, &defaultSwapChain)) &&
+        defaultSwapChain != nullptr) {
+        defaultSwapChainReady = PatchSwapChain(defaultSwapChain);
+        defaultSwapChain->Release();
+    }
+    if (translateManagedResources && !defaultSwapChainReady) {
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9ex_default_swapchain_hook_failed",
+            "D3D9Ex compatibility was rejected because the default "
+            "swap-chain Present path could not be intercepted safely.");
+    }
+    return compatibilityReady &&
+        (!translateManagedResources || defaultSwapChainReady);
 }
 
-void PatchD3D9(IDirect3D9* direct3D, bool hasEx) noexcept {
+bool PatchD3D9(IDirect3D9* direct3D, bool hasEx) noexcept {
     if (direct3D == nullptr) {
-        return;
+        return false;
     }
     void** vtable = *reinterpret_cast<void***>(direct3D);
     AcquireSRWLockExclusive(&g_hookLock);
-    for (const D3D9VtableRecord& record : g_d3d9Records) {
-        if (record.vtable == vtable) {
-            ReleaseSRWLockExclusive(&g_hookLock);
-            return;
-        }
-    }
+    D3D9VtableRecord* selected = nullptr;
     for (D3D9VtableRecord& record : g_d3d9Records) {
-        if (record.vtable == nullptr) {
-            record.vtable = vtable;
-            record.createDevice = reinterpret_cast<CreateDeviceFunction>(
-                vtable[16]);
-            ReplaceVtableEntry(vtable, 16,
-                               reinterpret_cast<void*>(&HookCreateDevice));
-            if (hasEx) {
-                record.createDeviceEx =
-                    reinterpret_cast<CreateDeviceExFunction>(vtable[20]);
-                ReplaceVtableEntry(
-                    vtable, 20,
-                    reinterpret_cast<void*>(&HookCreateDeviceEx));
-            }
+        if (record.vtable == vtable) {
+            selected = &record;
             break;
         }
     }
+    if (selected == nullptr) {
+        for (D3D9VtableRecord& record : g_d3d9Records) {
+            if (record.vtable == nullptr) {
+                selected = &record;
+                selected->vtable = vtable;
+                selected->createDevice =
+                    reinterpret_cast<CreateDeviceFunction>(vtable[16]);
+                break;
+            }
+        }
+    }
+    if (selected != nullptr && !selected->createDeviceHookActive) {
+        selected->createDeviceHookActive = ReplaceVtableEntry(
+            vtable, 16, reinterpret_cast<void*>(&HookCreateDevice));
+    }
+    if (selected != nullptr && hasEx &&
+        !selected->createDeviceExHookActive) {
+        if (selected->createDeviceEx == nullptr) {
+            selected->createDeviceEx =
+                reinterpret_cast<CreateDeviceExFunction>(vtable[20]);
+        }
+        selected->createDeviceExHookActive = ReplaceVtableEntry(
+            vtable, 20,
+            reinterpret_cast<void*>(&HookCreateDeviceEx));
+    }
+    const bool patched =
+        selected != nullptr && selected->createDeviceHookActive &&
+        (!hasEx || selected->createDeviceExHookActive);
     ReleaseSRWLockExclusive(&g_hookLock);
+    if (!patched) {
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9_factory_vtable_patch_failed",
+            "The Direct3D factory could not be intercepted safely.");
+    }
+    return patched;
 }
 
 D3D9VtableRecord FindD3D9Record(void** vtable) noexcept {
@@ -3904,6 +5181,67 @@ DeviceVtableRecord FindDeviceRecord(void** vtable) noexcept {
     return result;
 }
 
+SwapChainVtableRecord FindSwapChainRecord(void** vtable) noexcept {
+    SwapChainVtableRecord result;
+    AcquireSRWLockShared(&g_hookLock);
+    for (const SwapChainVtableRecord& record : g_swapChainRecords) {
+        if (record.vtable == vtable) {
+            result = record;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_hookLock);
+    return result;
+}
+
+ULONG STDMETHODCALLTYPE HookDeviceRelease(IDirect3DDevice9* self) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.release == nullptr) {
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9_device_release_record_missing",
+            "A hooked device Release call had no original target.");
+        return 0;
+    }
+
+    std::lock_guard<std::recursive_mutex> bindingLock(
+        g_managedIndexBindingCallMutex);
+    ManagedIndexBufferCompat* detachedBinding = nullptr;
+    if (record.addRef != nullptr) {
+        // Probe without changing the net count. When the caller owns the
+        // final external device reference and our bound inner resource owns
+        // the other one, detach the wrapper before the caller's Release.
+        // Releasing the wrapper can recursively release the device, which is
+        // why this path is serialized by a recursive mutex.
+        record.addRef(self);
+        const ULONG referencesBeforeRelease = record.release(self);
+        if (referencesBeforeRelease == 2) {
+            detachedBinding = TakeBoundManagedIndexBuffer(self);
+            if (detachedBinding != nullptr) {
+                detachedBinding->ReleaseFromBinding();
+            }
+        }
+    }
+    const ULONG remaining = record.release(self);
+    if (remaining == 0 && detachedBinding == nullptr) {
+        ManagedIndexBufferCompat* orphanedBinding =
+            TakeBoundManagedIndexBuffer(self);
+        if (orphanedBinding != nullptr) {
+            // A native D3D9 resource is expected to hold its parent device,
+            // so this state should be unreachable. Remove the stale device
+            // key but retain the wrapper rather than releasing a resource
+            // after its parent device has already been destroyed.
+            orphanedBinding->QuarantineAfterDeviceLoss();
+            GetBridge().LogHookStatus(
+                "ERROR", "d3d9ex_bound_index_release_order_invalid",
+                "A managed index binding outlived its device; the stale "
+                "device key and reset registry entry were removed, while "
+                "the wrapper was retained to avoid touching its dead parent.");
+        }
+    }
+    return remaining;
+}
+
 HRESULT STDMETHODCALLTYPE HookCreateDevice(
     IDirect3D9* self, UINT adapter, D3DDEVTYPE deviceType,
     HWND focusWindow, DWORD behaviorFlags,
@@ -3918,8 +5256,8 @@ HRESULT STDMETHODCALLTYPE HookCreateDevice(
     const HRESULT result = record.createDevice(
         self, adapter, deviceType, focusWindow, behaviorFlags, parameters,
         output);
-    if (SUCCEEDED(result) && output != nullptr) {
-        PatchDevice(*output);
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr) {
+        PatchDevice(*output, false, false);
     }
     return result;
 }
@@ -3936,14 +5274,213 @@ HRESULT STDMETHODCALLTYPE HookCreateDeviceEx(
         return D3DERR_INVALIDCALL;
     }
     ForceHighQualitySource(parameters);
-    const HRESULT result = record.createDeviceEx(
+    HRESULT result = record.createDeviceEx(
         self, adapter, deviceType, focusWindow, behaviorFlags, parameters,
         fullscreenMode, output);
-    if (SUCCEEDED(result) && output != nullptr) {
-        PatchDevice(*output);
+    const bool compatibilityRequested =
+        D3D9ExCompatibilityRequested();
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr &&
+        !PatchDevice(*output, true, compatibilityRequested) &&
+        compatibilityRequested) {
+        (*output)->Release();
+        *output = nullptr;
+        result = D3DERR_NOTAVAILABLE;
     }
     return result;
 }
+
+HRESULT STDMETHODCALLTYPE HookCreateAdditionalSwapChain(
+    IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters,
+    IDirect3DSwapChain9** output) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createAdditionalSwapChain == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    HRESULT result =
+        record.createAdditionalSwapChain(self, parameters, output);
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr) {
+        const bool patched = PatchSwapChain(*output);
+        if (!patched && D3D9ExCompatibilityRequested()) {
+            (*output)->Release();
+            *output = nullptr;
+            result = D3DERR_NOTAVAILABLE;
+        }
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookGetSwapChain(
+    IDirect3DDevice9* self, UINT index,
+    IDirect3DSwapChain9** output) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.getSwapChain == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    HRESULT result = record.getSwapChain(self, index, output);
+    if (SUCCEEDED(result) && output != nullptr && *output != nullptr) {
+        const bool patched = PatchSwapChain(*output);
+        if (!patched && D3D9ExCompatibilityRequested()) {
+            (*output)->Release();
+            *output = nullptr;
+            result = D3DERR_NOTAVAILABLE;
+        }
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateTexture(
+    IDirect3DDevice9* self, UINT width, UINT height, UINT levels,
+    DWORD usage, D3DFORMAT format, D3DPOOL pool,
+    IDirect3DTexture9** output, HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createTexture == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const bool translated =
+        TranslateManagedResource(usage, pool, true);
+    const HRESULT result = record.createTexture(
+        self, width, height, levels, usage, format, pool, output,
+        sharedHandle);
+    if (translated) {
+        LogManagedResourceResult(0, "texture", result);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateVolumeTexture(
+    IDirect3DDevice9* self, UINT width, UINT height, UINT depth,
+    UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+    IDirect3DVolumeTexture9** output, HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createVolumeTexture == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const bool translated =
+        TranslateManagedResource(usage, pool, true);
+    const HRESULT result = record.createVolumeTexture(
+        self, width, height, depth, levels, usage, format, pool,
+        output, sharedHandle);
+    if (translated) {
+        LogManagedResourceResult(1, "volume_texture", result);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateCubeTexture(
+    IDirect3DDevice9* self, UINT edgeLength, UINT levels, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture9** output,
+    HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createCubeTexture == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const bool translated =
+        TranslateManagedResource(usage, pool, true);
+    const HRESULT result = record.createCubeTexture(
+        self, edgeLength, levels, usage, format, pool, output,
+        sharedHandle);
+    if (translated) {
+        LogManagedResourceResult(2, "cube_texture", result);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateVertexBuffer(
+    IDirect3DDevice9* self, UINT length, DWORD usage, DWORD fvf,
+    D3DPOOL pool, IDirect3DVertexBuffer9** output,
+    HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createVertexBuffer == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const bool translated =
+        TranslateManagedResource(usage, pool, false);
+    const HRESULT result = record.createVertexBuffer(
+        self, length, usage, fvf, pool, output, sharedHandle);
+    if (translated) {
+        LogManagedResourceResult(3, "vertex_buffer", result);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateIndexBuffer(
+    IDirect3DDevice9* self, UINT length, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DIndexBuffer9** output,
+    HANDLE* sharedHandle) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.createIndexBuffer == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    const DWORD requestedUsage = usage;
+    const D3DPOOL requestedPool = pool;
+    const bool translated =
+        TranslateManagedResource(usage, pool, false);
+    if (output != nullptr) {
+        *output = nullptr;
+    }
+    IDirect3DIndexBuffer9* inner = nullptr;
+    HRESULT result = record.createIndexBuffer(
+        self, length, usage, format, pool, &inner, sharedHandle);
+    if (translated && SUCCEEDED(result) && inner != nullptr) {
+        ManagedIndexBufferCompat* compatibility = nullptr;
+        try {
+            compatibility = new (std::nothrow)
+                ManagedIndexBufferCompat(
+                    inner, requestedUsage, format, length);
+        } catch (const std::bad_alloc&) {
+            compatibility = nullptr;
+        }
+        if (compatibility == nullptr) {
+            inner->Release();
+            result = E_OUTOFMEMORY;
+        } else if (!compatibility->Registered()) {
+            compatibility->Release();
+            result = E_OUTOFMEMORY;
+        } else if (output == nullptr) {
+            compatibility->Release();
+            result = D3DERR_INVALIDCALL;
+        } else {
+            *output = compatibility;
+        }
+    } else if (output != nullptr) {
+        *output = inner;
+    } else if (inner != nullptr) {
+        inner->Release();
+        result = D3DERR_INVALIDCALL;
+    }
+    if (translated) {
+        LogManagedResourceResult(4, "index_buffer", result);
+        if (InterlockedCompareExchange(
+                &g_managedIndexCreateDetailsLogged,
+                TRUE, FALSE) == FALSE) {
+            std::ostringstream message;
+            message << "length=" << length
+                    << " requested_usage=0x" << std::hex
+                    << requestedUsage
+                    << " effective_usage=0x" << usage << std::dec
+                    << " requested_pool="
+                    << static_cast<unsigned>(requestedPool)
+                    << " effective_pool="
+                    << static_cast<unsigned>(pool)
+                    << " format=" << static_cast<unsigned>(format)
+                    << " HRESULT=0x" << std::hex << std::uppercase
+                    << static_cast<std::uint32_t>(result);
+            GetBridge().LogHookStatus(
+                SUCCEEDED(result) ? "INFO" : "ERROR",
+                "d3d9ex_managed_index_create_details",
+                message.str());
+        }
+    }
+    return result;
+}
+
 
 HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* self,
                                      D3DPRESENT_PARAMETERS* parameters) {
@@ -3952,9 +5489,27 @@ HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* self,
     if (record.reset == nullptr) {
         return D3DERR_INVALIDCALL;
     }
+    std::lock_guard<std::recursive_mutex> bindingLock(
+        g_managedIndexBindingCallMutex);
+    if (D3D9ExCompatibilityRequested() &&
+        !D3D9ExExclusiveRequested() && parameters != nullptr) {
+        D3DDEVICE_CREATION_PARAMETERS creation{};
+        HWND focusWindow = nullptr;
+        if (SUCCEEDED(self->GetCreationParameters(&creation))) {
+            focusWindow = creation.hFocusWindow;
+        }
+        TranslateD3D9ExPresentation(focusWindow, parameters);
+    }
     ForceHighQualitySource(parameters);
+    if (D3D9ExCompatibilityRequested()) {
+        PrepareManagedIndexBuffersForReset();
+    }
     GetBridge().BeforeReset();
     const HRESULT result = record.reset(self, parameters);
+    if (SUCCEEDED(result) && D3D9ExCompatibilityRequested()) {
+        ReplaceBoundManagedIndexBuffer(self, nullptr);
+        RestoreManagedIndexBuffersAfterReset();
+    }
     GetBridge().AfterReset(result);
     return result;
 }
@@ -3969,9 +5524,280 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* self,
     if (record.present == nullptr) {
         return D3DERR_INVALIDCALL;
     }
+    InterlockedIncrement64(&g_presentHookCounts[0]);
     GetBridge().CapturePresent(self);
     return record.present(self, source, destination, overrideWindow,
                           dirtyRegion);
+}
+
+HRESULT STDMETHODCALLTYPE HookResetEx(
+    IDirect3DDevice9Ex* self, D3DPRESENT_PARAMETERS* parameters,
+    D3DDISPLAYMODEEX* fullscreenMode) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.resetEx == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    std::lock_guard<std::recursive_mutex> bindingLock(
+        g_managedIndexBindingCallMutex);
+    bool translated = false;
+    if (D3D9ExCompatibilityRequested() &&
+        !D3D9ExExclusiveRequested() && parameters != nullptr) {
+        D3DDEVICE_CREATION_PARAMETERS creation{};
+        HWND focusWindow = nullptr;
+        if (SUCCEEDED(self->GetCreationParameters(&creation))) {
+            focusWindow = creation.hFocusWindow;
+        }
+        translated =
+            TranslateD3D9ExPresentation(focusWindow, parameters);
+    }
+    if (translated) {
+        fullscreenMode = nullptr;
+    }
+    ForceHighQualitySource(parameters);
+    if (D3D9ExCompatibilityRequested()) {
+        PrepareManagedIndexBuffersForReset();
+    }
+    GetBridge().BeforeReset();
+    const HRESULT result =
+        record.resetEx(self, parameters, fullscreenMode);
+    if (SUCCEEDED(result) && D3D9ExCompatibilityRequested()) {
+        ReplaceBoundManagedIndexBuffer(self, nullptr);
+        RestoreManagedIndexBuffersAfterReset();
+    }
+    GetBridge().AfterReset(result);
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookPresentEx(
+    IDirect3DDevice9Ex* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion, DWORD flags) {
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (record.presentEx == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    InterlockedIncrement64(&g_presentHookCounts[1]);
+    GetBridge().CapturePresent(self);
+    return record.presentEx(
+        self, source, destination, overrideWindow, dirtyRegion, flags);
+}
+
+HRESULT STDMETHODCALLTYPE HookSwapChainPresent(
+    IDirect3DSwapChain9* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion, DWORD flags) {
+    const SwapChainVtableRecord record =
+        FindSwapChainRecord(*reinterpret_cast<void***>(self));
+    if (record.present == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    InterlockedIncrement64(&g_presentHookCounts[2]);
+    ComPtr<IDirect3DDevice9> device;
+    ComPtr<IDirect3DSurface9> backBuffer;
+    if (SUCCEEDED(self->GetDevice(device.GetAddressOf())) && device &&
+        SUCCEEDED(self->GetBackBuffer(
+            0, D3DBACKBUFFER_TYPE_MONO,
+            backBuffer.GetAddressOf())) &&
+        backBuffer) {
+        GetBridge().CapturePresent(device.Get(), backBuffer.Get());
+    }
+    return record.present(
+        self, source, destination, overrideWindow, dirtyRegion, flags);
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalReset(
+    IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* parameters) {
+    if (g_appLocalReset == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    if (InterlockedCompareExchange(
+            &g_appLocalHooksActive, FALSE, FALSE) == FALSE) {
+        return g_appLocalReset(self, parameters);
+    }
+    std::lock_guard<std::recursive_mutex> bindingLock(
+        g_managedIndexBindingCallMutex);
+    const DeviceVtableRecord record =
+        FindDeviceRecord(*reinterpret_cast<void***>(self));
+    if (D3D9ExCompatibilityRequested() &&
+        !D3D9ExExclusiveRequested() && parameters != nullptr) {
+        D3DDEVICE_CREATION_PARAMETERS creation{};
+        HWND focusWindow = nullptr;
+        if (SUCCEEDED(self->GetCreationParameters(&creation))) {
+            focusWindow = creation.hFocusWindow;
+        }
+        TranslateD3D9ExPresentation(focusWindow, parameters);
+    }
+    ForceHighQualitySource(parameters);
+    if (D3D9ExCompatibilityRequested()) {
+        PrepareManagedIndexBuffersForReset();
+    }
+    GetBridge().BeforeReset();
+
+    HRESULT result = D3DERR_INVALIDCALL;
+    ComPtr<IDirect3DDevice9Ex> deviceEx;
+    if (D3D9ExCompatibilityRequested() &&
+        record.resetEx != nullptr &&
+        SUCCEEDED(self->QueryInterface(
+            __uuidof(IDirect3DDevice9Ex),
+            reinterpret_cast<void**>(deviceEx.GetAddressOf()))) &&
+        deviceEx) {
+        D3DDISPLAYMODEEX displayMode{};
+        D3DDISPLAYMODEEX* displayModePointer = nullptr;
+        if (D3D9ExExclusiveRequested() && parameters != nullptr &&
+            !parameters->Windowed) {
+            displayMode.Size = sizeof(displayMode);
+            if (FAILED(deviceEx->GetDisplayModeEx(
+                    0, &displayMode, nullptr))) {
+                displayMode.Width = parameters->BackBufferWidth;
+                displayMode.Height = parameters->BackBufferHeight;
+                displayMode.RefreshRate =
+                    parameters->FullScreen_RefreshRateInHz;
+                displayMode.Format = parameters->BackBufferFormat;
+                displayMode.ScanLineOrdering =
+                    D3DSCANLINEORDERING_PROGRESSIVE;
+            } else {
+                if (parameters->BackBufferWidth != 0) {
+                    displayMode.Width =
+                        parameters->BackBufferWidth;
+                }
+                if (parameters->BackBufferHeight != 0) {
+                    displayMode.Height =
+                        parameters->BackBufferHeight;
+                }
+                if (parameters->BackBufferFormat != D3DFMT_UNKNOWN) {
+                    displayMode.Format =
+                        parameters->BackBufferFormat;
+                }
+                if (parameters->FullScreen_RefreshRateInHz != 0) {
+                    displayMode.RefreshRate =
+                        parameters->FullScreen_RefreshRateInHz;
+                }
+            }
+            parameters->FullScreen_RefreshRateInHz =
+                displayMode.RefreshRate;
+            displayModePointer = &displayMode;
+        }
+        result = record.resetEx(
+            deviceEx.Get(), parameters, displayModePointer);
+        GetBridge().LogHookStatus(
+            SUCCEEDED(result) ? "INFO" : "ERROR",
+            "d3d9ex_reset_redirected",
+            SUCCEEDED(result)
+                ? "Classic Reset completed through ResetEx."
+                : "Classic Reset redirected to ResetEx but failed.");
+    } else {
+        result = g_appLocalReset(self, parameters);
+    }
+    if (SUCCEEDED(result) && D3D9ExCompatibilityRequested()) {
+        ReplaceBoundManagedIndexBuffer(self, nullptr);
+        RestoreManagedIndexBuffersAfterReset();
+    }
+    GetBridge().AfterReset(result);
+    return result;
+}
+
+
+HRESULT STDMETHODCALLTYPE HookAppLocalPresent(
+    IDirect3DDevice9* self, const RECT* source,
+    const RECT* destination, HWND overrideWindow,
+    const RGNDATA* dirtyRegion) {
+    if (g_appLocalPresent == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    if (InterlockedCompareExchange(
+            &g_appLocalHooksActive, FALSE, FALSE) == FALSE) {
+        return g_appLocalPresent(
+            self, source, destination, overrideWindow, dirtyRegion);
+    }
+    InterlockedIncrement64(&g_presentHookCounts[0]);
+    GetBridge().CapturePresent(self);
+    return g_appLocalPresent(
+        self, source, destination, overrideWindow, dirtyRegion);
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalSetIndices(
+    IDirect3DDevice9* self, IDirect3DIndexBuffer9* indexBuffer) {
+    if (g_appLocalSetIndices == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    if (InterlockedCompareExchange(
+            &g_appLocalHooksActive, FALSE, FALSE) == FALSE) {
+        return g_appLocalSetIndices(self, indexBuffer);
+    }
+
+    // D3DCREATE_MULTITHREADED serializes the runtime call, but the wrapper
+    // ownership table is outside the runtime. Keep both operations in the
+    // same order so GetIndices always observes the matching wrapper.
+    std::lock_guard<std::recursive_mutex> bindingLock(
+        g_managedIndexBindingCallMutex);
+    ManagedIndexBufferCompat* retainedWrapper =
+        RetainManagedIndexBufferForBinding(indexBuffer);
+    if (retainedWrapper != nullptr &&
+        !CanTrackBoundManagedIndexBuffer(self, retainedWrapper)) {
+        retainedWrapper->ReleaseFromBinding();
+        GetBridge().LogHookStatus(
+            "ERROR", "d3d9ex_bound_index_registry_full",
+            "SetIndices was rejected before the native binding changed "
+            "because no wrapper-ownership slot was available.");
+        return D3DERR_OUTOFVIDEOMEMORY;
+    }
+    ComPtr<IDirect3DIndexBuffer9> inner;
+    IDirect3DIndexBuffer9* effectiveBuffer = indexBuffer;
+    if (indexBuffer != nullptr &&
+        SUCCEEDED(indexBuffer->QueryInterface(
+            kManagedIndexBufferInner,
+            reinterpret_cast<void**>(inner.GetAddressOf()))) &&
+        inner != nullptr) {
+        effectiveBuffer = inner.Get();
+    }
+    const bool unwrapped = effectiveBuffer != indexBuffer;
+    const HRESULT result =
+        g_appLocalSetIndices(self, effectiveBuffer);
+    LogManagedIndexSetIndicesLifecycle(
+        indexBuffer, result, unwrapped);
+    if (SUCCEEDED(result)) {
+        ReplaceBoundManagedIndexBufferLocked(self, retainedWrapper);
+        retainedWrapper = nullptr;
+    }
+    if (retainedWrapper != nullptr) {
+        retainedWrapper->ReleaseFromBinding();
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookAppLocalGetIndices(
+    IDirect3DDevice9* self, IDirect3DIndexBuffer9** indexBuffer) {
+    if (g_appLocalGetIndices == nullptr) {
+        return D3DERR_INVALIDCALL;
+    }
+    if (InterlockedCompareExchange(
+            &g_appLocalHooksActive, FALSE, FALSE) == FALSE) {
+        return g_appLocalGetIndices(self, indexBuffer);
+    }
+    if (indexBuffer == nullptr) {
+        return g_appLocalGetIndices(self, nullptr);
+    }
+
+    *indexBuffer = nullptr;
+    std::lock_guard<std::recursive_mutex> bindingLock(
+        g_managedIndexBindingCallMutex);
+    IDirect3DIndexBuffer9* inner = nullptr;
+    const HRESULT result = g_appLocalGetIndices(self, &inner);
+    if (SUCCEEDED(result) && inner != nullptr) {
+        ManagedIndexBufferCompat* wrapper =
+            RetainManagedIndexBufferByInner(inner);
+        if (wrapper != nullptr) {
+            inner->Release();
+            *indexBuffer = wrapper;
+        } else {
+            *indexBuffer = inner;
+        }
+    } else {
+        *indexBuffer = inner;
+    }
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE HookSetViewport(
@@ -4031,6 +5857,7 @@ HRESULT STDMETHODCALLTYPE HookLatePresent(
     if (g_latePresent == nullptr) {
         return D3DERR_INVALIDCALL;
     }
+    InterlockedIncrement64(&g_presentHookCounts[0]);
     GetBridge().CapturePresent(self);
     return g_latePresent(self, source, destination, overrideWindow,
                          dirtyRegion);
@@ -4274,8 +6101,8 @@ void OnDirect3D9Created(IDirect3D9* direct3D) noexcept {
     PatchD3D9(direct3D, false);
 }
 
-void OnDirect3D9ExCreated(IDirect3D9Ex* direct3D) noexcept {
-    PatchD3D9(direct3D, true);
+bool OnDirect3D9ExCreated(IDirect3D9Ex* direct3D) noexcept {
+    return PatchD3D9(direct3D, true);
 }
 
 void ApplyEngineFixes() noexcept {
@@ -4288,6 +6115,35 @@ BOOL InstallLateD3D9Hooks() noexcept {
         return FALSE;
     }
     return g_lateHookResult;
+}
+
+BOOL AreLateD3D9HooksActive() noexcept {
+    return InterlockedCompareExchange(
+        &g_lateHooksActive, FALSE, FALSE) != FALSE;
+}
+
+std::uint64_t PresentHookCount(std::uint32_t kind) noexcept {
+    if (kind >= 3) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(
+        InterlockedCompareExchange64(
+            &g_presentHookCounts[kind], 0, 0));
+}
+
+std::uint32_t ManagedIndexBindingCount() noexcept {
+    std::lock_guard<std::recursive_mutex> bindingLock(
+        g_managedIndexBindingCallMutex);
+    std::uint32_t count = 0;
+    AcquireSRWLockShared(&g_boundManagedIndexLock);
+    for (const BoundManagedIndexBuffer& record :
+         g_boundManagedIndexBuffers) {
+        if (record.device != nullptr && record.buffer != nullptr) {
+            ++count;
+        }
+    }
+    ReleaseSRWLockShared(&g_boundManagedIndexLock);
+    return count;
 }
 
 BOOL IsHostConnected() noexcept {

@@ -15,9 +15,12 @@ namespace fearvr {
 using StereoToggleCallback = void(__cdecl*)(BOOL enabled);
 
 void OnDirect3D9Created(IDirect3D9* direct3D) noexcept;
-void OnDirect3D9ExCreated(IDirect3D9Ex* direct3D) noexcept;
+bool OnDirect3D9ExCreated(IDirect3D9Ex* direct3D) noexcept;
 void ApplyEngineFixes() noexcept;
 BOOL InstallLateD3D9Hooks() noexcept;
+BOOL AreLateD3D9HooksActive() noexcept;
+std::uint64_t PresentHookCount(std::uint32_t kind) noexcept;
+std::uint32_t ManagedIndexBindingCount() noexcept;
 
 BOOL IsHostConnected() noexcept;
 BOOL IsStereoAvailable() noexcept;

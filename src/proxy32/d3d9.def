@@ -23,7 +23,11 @@ EXPORTS
     FearVr_CaptureEye
     FearVr_EndStereoFrame
     FearVr_ReportHookStatus
+    FearVr_ApplyEngineFixes
     FearVr_InstallIatHook
+    FearVr_AreLateHooksActive
+    FearVr_GetPresentHookCount
+    FearVr_GetManagedIndexBindingCount
     FearVr_Ordinal16 @16 NONAME
     FearVr_Ordinal17 @17 NONAME
     FearVr_Ordinal18 @18 NONAME

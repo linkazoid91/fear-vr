@@ -1,16 +1,17 @@
 ﻿<#
 .SYNOPSIS
-    Startet F.E.A.R. VR.
+    Starts F.E.A.R. VR.
 
 .DESCRIPTION
-    Startet den x64-OpenXR-Host, wartet auf XR-ready und ruft danach Steam mit
-    der offiziellen App-ID auf. Geladen wird ausschliesslich ueber die lose
-    archcfg-Schicht; die Retail-Installation bleibt unveraendert.
+    Starts the x64 OpenXR host, waits for XR readiness, and then invokes Steam
+    with the official app ID. Game modules come from the loose archcfg layer;
+    the hash-verified app-local d3d9.dll proxy owns Direct3D creation without
+    replacing FEAR.exe or game data.
 
 .PARAMETER Runtime
-    active (Standard), steamvr, vdxr oder ein Pfad zu einem
-    OpenXR-Runtime-Manifest. Erzwungen wird ueber XR_RUNTIME_JSON, nur fuer
-    den Hostprozess; die systemweite Einstellung bleibt unangetastet.
+    active (default), steamvr, vdxr, or a path to an OpenXR runtime manifest.
+    XR_RUNTIME_JSON applies the override to the host process only; the
+    system-wide setting remains unchanged.
 #>
 [CmdletBinding()]
 param(
@@ -24,8 +25,14 @@ param(
 
     [switch]$NoHeadBob,
 
-    # Diagnose: schaltet Gruppen unserer Schreibzugriffe auf Retail-Objekte ab,
-    # um den Absturz an einer bestimmten Stelle einzugrenzen.
+    # Opt-in until the D3D9Ex compatibility path passes Retail validation.
+    [switch]$D3D9Ex,
+
+    # Diagnostic option: retain Retail's exclusive fullscreen request.
+    [switch]$D3D9ExExclusive,
+
+    # Diagnostic: disables groups of writes to Retail objects to narrow down
+    # a crash location.
     [switch]$Safe,
 
     [switch]$NoFlashlight,
@@ -36,30 +43,30 @@ param(
 
     [switch]$NoBodyHide,
 
-    # Schaltet den Stereo-Doppelrender ab: Weltrender laeuft einmal pro Frame.
+    # Disables double stereo rendering so the world renders once per frame.
     [switch]$NoStereo,
 
-    # Laesst den kompletten Client-Input-Hook weg: keine Controllersteuerung
-    # und keine Kommando-Injektion. Spielbar bleibt es mit Maus und Tastatur.
+    # Omits the complete client input hook: no controller input or command
+    # injection. Mouse and keyboard remain available.
     [switch]$NoInput,
 
-    # Input-Hook bleibt installiert, schreibt aber keine Kommandobits mehr.
+    # Keeps the input hook installed but writes no command bits.
     [switch]$NoInject,
 
-    # Laesst den Hook auf die Retail-Bindungsabfrage weg.
+    # Omits the Retail binding-query hook.
     [switch]$NoBindingHook,
 
-    # Laesst die Arbeit im IClientShell::Update-Hook weg.
+    # Omits work performed by the IClientShell::Update hook.
     [switch]$NoClientUpdate,
 
-    # Misst nur die rohe Present-Rate. Das Spiel bleibt im Desktopfenster
-    # sichtbar, aber es werden absichtlich keine Bilder ins Headset kopiert.
+    # Measures raw Present rate only. The game remains visible in its desktop
+    # window, but no images are copied to the headset.
     [switch]$NoCapture,
 
-    # Diagnose-Rollback für den verifizierten Jupiter-EX-HID-FPS-Fix.
+    # Diagnostic rollback for the verified Jupiter EX HID frame-rate fix.
     [switch]$NoHidFpsFix,
 
-    # Diagnose-Rollback: FEAR nicht am OpenXR-Renderauftrag takten.
+    # Diagnostic rollback: do not pace FEAR to OpenXR render requests.
     [switch]$NoXrFramePacing,
 
     # Linear resolution scale for native stereo world rendering. Menus and
@@ -67,13 +74,13 @@ param(
     [ValidateRange(100, 200)]
     [int]$RenderScale = 100,
 
-    # Laesst Weapon-Manager-, AimAt- und Fire-Vector-Hook ungesetzt.
+    # Omits the weapon-manager, AimAt, and fire-vector hooks.
     [switch]$NoAimHooks,
 
-    # Laesst nur den AimAt-Node-Tracker ungesetzt.
+    # Omits only the AimAt node tracker.
     [switch]$NoAimAt,
 
-    # AimAt-Hook bleibt gesetzt, ueberschreibt das Ziel aber nie.
+    # Keeps the AimAt hook installed but never overrides its target.
     [switch]$AimAtPassthrough,
 
     [switch]$Wait
@@ -83,6 +90,17 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\_fearvr-release.ps1"
 $packageRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+Assert-FearVrSafeInstallDirectory `
+    -InstallDir $InstallDir `
+    -ProtectedRoots @($packageRoot) | Out-Null
+$transactionPath = Get-FearVrProxyTransactionPath $InstallDir
+if (Test-Path -LiteralPath $transactionPath) {
+    throw (
+        "An unfinished proxy transaction exists in '$InstallDir'. " +
+        'Run install.ps1 or uninstall.ps1 to recover it before launching.')
+}
+
 $deploymentPath = Join-Path $InstallDir 'deployment.json'
 if (-not (Test-Path -LiteralPath $deploymentPath -PathType Leaf)) {
     throw @"
@@ -90,9 +108,9 @@ Keine Installation in '$InstallDir'.
 Zuerst install.ps1 ausfuehren.
 "@
 }
-$deployment = Get-Content -Raw -LiteralPath $deploymentPath | ConvertFrom-Json
+$deployment = Read-FearVrOwnedDeployment $InstallDir
 
-# --- Integritaet ------------------------------------------------------------
+# --- Integrity --------------------------------------------------------------
 $retail = Assert-RetailFearExe $deployment.retailRoot
 if (-not (Test-CompatibleRetailFearHashes `
         $deployment.runtimeSha256 $retail.Sha256)) {
@@ -118,14 +136,50 @@ foreach ($record in $deployment.files) {
     }
 }
 
+$d3d9ExAvailable = $false
+if ($deployment.PSObject.Properties.Name -contains 'd3d9ExCompatibility' -and
+    [bool]$deployment.d3d9ExCompatibility) {
+    if (-not ($deployment.PSObject.Properties.Name -contains 'd3d9Proxy')) {
+        throw 'Proxy metadata is missing. Please reinstall F.E.A.R. VR.'
+    }
+    $proxyState = Get-FearVrAppLocalProxyState `
+        -RetailRoot ([string]$deployment.retailRoot) `
+        -Record $deployment.d3d9Proxy
+    switch ($proxyState.Status) {
+        'Owned' {
+            $d3d9ExAvailable = $true
+        }
+        'Missing' {
+            Write-Host @"
+  [!]  The F.E.A.R. VR app-local d3d9.dll is missing.
+       Classic D3D9 can continue through the named bridge. Reinstall before
+       using the D3D9Ex compatibility path.
+"@ -ForegroundColor Yellow
+        }
+        'Modified' {
+            throw ("The app-local d3d9.dll was replaced or modified: " +
+                   "$($proxyState.Path). Refusing to load an untracked wrapper.")
+        }
+        default {
+            throw 'Proxy metadata is invalid. Please reinstall F.E.A.R. VR.'
+        }
+    }
+}
+if ($D3D9ExExclusive -and -not $D3D9Ex) {
+    throw '-D3D9ExExclusive requires -D3D9Ex.'
+}
+if ($D3D9Ex -and -not $d3d9ExAvailable) {
+    throw 'D3D9Ex compatibility is unavailable for this installation.'
+}
+
 $hostExe = Join-Path $packageRoot 'bin\x64\fearvr-host.exe'
 if (-not (Test-Path -LiteralPath $hostExe -PathType Leaf)) {
     throw "Hostprogramm fehlt: $hostExe"
 }
 
-# Steam-Installationen brauchen den Umweg ueber steam.exe -applaunch. GOG-
-# und DVD-Installationen starten direkt; die Argumente sind dieselben.
-# Aeltere deployment.json ohne launchMode sind Steam-Installationen.
+# Steam installs require steam.exe -applaunch. GOG and retail-disc installs
+# start directly with the same arguments.
+# Older deployment.json files without launchMode represent Steam installs.
 $launchMode = 'steam'
 if ($deployment.PSObject.Properties.Name -contains 'launchMode' -and
     $deployment.launchMode) {
@@ -164,14 +218,14 @@ Write-Host '=== F.E.A.R. VR ===' -ForegroundColor Cyan
 Write-Host "Runtime: $($runtimeInfo.Name)$(if ($runtimeInfo.Override) { ' (erzwungen)' })"
 Write-Host "Logs:    $runLogDirectory"
 
-# SteamVR 2.x legt sonst eine Theaterflaeche ueber die laufende OpenXR-Szene.
-# Andere Runtimes kennen das nicht; dort wird nichts angefasst.
+# SteamVR 2.x otherwise overlays a theater surface on the active OpenXR scene.
+# Other runtimes do not use it and are left untouched.
 $theaterScript = Join-Path $PSScriptRoot 'disable-steamvr-theater.ps1'
 if ($usesSteamVr -and (Test-Path -LiteralPath $theaterScript -PathType Leaf)) {
     & $theaterScript -Quiet
 }
 
-# --- Host starten -----------------------------------------------------------
+# --- Start the host ---------------------------------------------------------
 $hostArguments = @(
     '--ipc-session', $sessionText,
     '--exit-on-game-disconnect',
@@ -187,7 +241,7 @@ try {
     $env:XR_RUNTIME_JSON = $previousRuntimeJson
 }
 
-# Uebersetzt die Fehlermeldung des Hosts in einen brauchbaren Hinweis.
+# Turns the host failure into actionable guidance.
 function Get-HostFailureHint([string]$LogDirectory) {
     $log = Get-ChildItem -LiteralPath $LogDirectory -Filter 'host-*.log' `
         -File -ErrorAction SilentlyContinue |
@@ -240,7 +294,7 @@ if (-not $ready) {
     throw 'OpenXR-Host wurde nicht innerhalb von 30 Sekunden bereit.'
 }
 
-# --- Spiel starten ----------------------------------------------------------
+# --- Start the game ---------------------------------------------------------
 $gameArguments = @(
     '-fearvr-session', $sessionText,
     '-fearvr-logdir', "`"$runLogDirectory`"",
@@ -248,6 +302,8 @@ $gameArguments = @(
     '-userdirectory', "`"$($deployment.userDirectory)`"",
     '-fearvr-stereo-toggle'
 )
+if ($D3D9Ex) { $gameArguments += '-fearvr-d3d9ex-compat' }
+if ($D3D9ExExclusive) { $gameArguments += '-fearvr-d3d9ex-exclusive' }
 if (-not $NoInput) { $gameArguments += '-fearvr-input' }
 if ($Translation) { $gameArguments += '-fearvr-translation' }
 if (-not $NoStereoHud) { $gameArguments += '-fearvr-stereo-hud' }
@@ -277,10 +333,9 @@ if ($launchMode -eq 'steam') {
     Start-Process -FilePath $steamExe -ArgumentList ($steamArguments -join ' ') `
         -WorkingDirectory (Split-Path -Parent $steamExe) | Out-Null
 } else {
-    # GOG und Retail-DVD: Dieselben Argumente gehen direkt an FEAR.exe. Das
-    # Arbeitsverzeichnis muss der Spielordner sein, sonst findet die Engine
-    # ihre eigenen Ressourcen nicht. Geschrieben wird dort nichts: Alles
-    # Veraenderliche liegt hinter -archcfg und -userdirectory.
+    # GOG and retail disc: pass the same arguments directly to FEAR.exe. The
+    # working directory must be the game folder so the engine finds its own
+    # resources. Mutable data remains behind -archcfg and -userdirectory.
     Start-Process -FilePath $retail.Path -ArgumentList ($gameArguments -join ' ') `
         -WorkingDirectory $deployment.retailRoot | Out-Null
 }

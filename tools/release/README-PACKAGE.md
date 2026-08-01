@@ -59,6 +59,10 @@ cannot be found, the installer shows examples and asks for it.
 > archive configuration and aborts with "Failed to initialize client - unable
 > to load game resources". The installer rejects such targets.
 
+The installer also places one reversible app-local `d3d9.dll` beside
+`FEAR.exe`. Its exact path and SHA-256 hash are recorded in the deployment
+manifest. An existing third-party `d3d9.dll` is never overwritten.
+
 Options:
 
 ```powershell
@@ -91,7 +95,8 @@ longer uses are removed. **Saved games and profiles stay.** Close the game
 first — while `FEAR.exe` runs, its modules are locked and the installer
 refuses to continue.
 
-`-Clean` wipes the install folder except `userdata` before staging again.
+`-Clean` removes stale installer-owned modules and old logs only after the new
+deployment commits. `userdata`, unknown files, and reparse points are kept.
 
 ## Playing
 
@@ -113,6 +118,8 @@ tools\play.ps1 -NoCapture         # raw Present-rate diagnosis; headset image of
 tools\play.ps1 -NoHidFpsFix       # diagnostic rollback of the Jupiter EX HID fix
 tools\play.ps1 -NoXrFramePacing   # allow duplicate XR requests for A/B testing
 tools\play.ps1 -RenderScale 150   # supersample native stereo world rendering
+tools\play.ps1 -D3D9Ex            # experimental direct-GPU path; may render black
+tools\play.ps1 -D3D9ExExclusive   # use exclusive fullscreen with -D3D9Ex
 ```
 
 `-Runtime` sets `XR_RUNTIME_JSON` for the host process only. The system-wide
@@ -122,6 +129,12 @@ runtime setting is never changed.
 stereo gameplay. Retail menus and videos keep their original backbuffer.
 Start with 125 or 150 percent: classic-D3D9 CPU readback cost grows with the
 number of pixels.
+
+`-D3D9Ex` opts into an experimental compatibility layer that creates a
+D3D9Ex device for Retail's classic D3D9 calls. It can enable direct shared
+GPU textures, but the previous Retail experiment rendered black and this
+integration has not yet been validated in the game. The classic path remains
+the default. `-D3D9ExExclusive` is a diagnostic mode and requires `-D3D9Ex`.
 
 A Steam copy needs the Steam client running, because F.E.A.R. officially
 starts through `steam.exe -applaunch 21090`. GOG and disc copies do not need
@@ -186,18 +199,21 @@ powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1 -Apply   # remove
 **Saved games are kept.** They live in `<InstallDir>\userdata` and are only
 removed with `-IncludeUserData`.
 
-The retail installation is never written to at any point. A Steam file
-verification is not needed; as far as Steam is concerned the installation is
-unmodified.
+Uninstall removes the app-local `d3d9.dll` only when its SHA-256 hash still
+matches the copy installed by this package. A modified or third-party wrapper
+is preserved and reported. `FEAR.exe`, the game archives, and retail data are
+never modified.
 
 ## Known limits
 
-- The classic D3D9 path still needs one CPU readback per eye and frame
-  (`FEARVR_BF_CPU_FALLBACK` in the log). F.E.A.R. creates a plain
-  `IDirect3DDevice9`, and D3D9 can only share surfaces between processes from
-  a D3D9Ex device — so this is the one remaining copy. The zero-copy
-  `DirectShared` path exists and engages as soon as the device is an Ex
-  device.
+- The default classic D3D9 path still needs one CPU readback per eye and frame
+  (`FEARVR_BF_CPU_FALLBACK` in the log). The opt-in D3D9Ex path can select
+  `DirectShared`, but it remains experimental and may render black in Retail.
+- Managed index buffers preserve their classic descriptor, binding identity,
+  and contents across reset. Other managed resources currently receive only
+  D3D9Ex pool and usage translation.
+- A missing package-owned app-local proxy is reported before launch. An
+  existing foreign `d3d9.dll` stops installation instead of being replaced.
 - The stereo HUD compositor, by contrast, **no longer reads back**: the pixel
   comparison runs as a `ps_2_0` shader on the GPU, and the coverage heuristic
   that separates the HUD from fullscreen effects reads a few kilobytes one
