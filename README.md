@@ -155,6 +155,16 @@ Valve's runtime manifest—not a separate renderer or a compatibility wrapper.
 VDXR can be selected with `-Runtime vdxr`; the system-wide OpenXR setting is
 never changed.
 
+The SteamVR launcher does not assume that Steam is on `C:`. It first accepts
+an active SteamVR OpenXR manifest, then checks Steam's registered install
+folder, every library in `steamapps\libraryfolders.vdf`, and SteamVR's app
+manifest. A fully explicit manifest path remains available if Steam's
+registration is damaged:
+
+```powershell
+.\Start F.E.A.R. VR.cmd -Runtime "D:\SteamLibrary\steamapps\common\SteamVR\steamxr_win64.json"
+```
+
 Steam still has to run as the store front for a Steam copy
 (`-applaunch 21090`). This is independent of which VR runtime renders.
 

@@ -45,8 +45,6 @@ $script:FearVrRelease = [ordered]@{
         'fearvr-d3d9.dll' = 'game-modules\fearvr-d3d9.dll'
     }
 
-    SteamVrManifest =
-        'C:\Program Files (x86)\Steam\steamapps\common\SteamVR\steamxr_win64.json'
     VdxrManifest =
         'C:\Program Files\Virtual Desktop Streamer\OpenXR\virtualdesktop-openxr.json'
 }
@@ -148,6 +146,166 @@ function Get-LocalDriveRoots {
     return $roots
 }
 
+# Normalisiert einen Windows-Pfad und fuegt ihn nur einmal hinzu. Steam legt
+# Pfade je nach Registrywert bzw. VDF-Datei mit Vorwaerts- oder doppelten
+# Rueckwaertsschraegstrichen ab.
+function Add-UniqueFearVrPath(
+    [Collections.Generic.List[string]]$List,
+    [string]$Path
+) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $normalised = $Path.Trim().Trim('"') -replace '/', '\'
+    try { $normalised = [IO.Path]::GetFullPath($normalised) } catch { return }
+
+    $pathRoot = [IO.Path]::GetPathRoot($normalised)
+    if ($normalised.Length -gt $pathRoot.Length) {
+        $normalised = $normalised.TrimEnd('\')
+    }
+    foreach ($existing in $List) {
+        if ([string]::Equals(
+                $existing, $normalised,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            return
+        }
+    }
+    $List.Add($normalised)
+}
+
+# Steam kann selbst auf einem anderen Laufwerk liegen. Die Registry ist die
+# primaere Quelle; ein laufender Client und die gaengigen Ordner auf lokalen
+# Laufwerken decken portable bzw. beschaedigte Registry-Installationen ab.
+function Get-SteamInstallRoots {
+    $roots = New-Object Collections.Generic.List[string]
+    foreach ($key in @(
+        'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam',
+        'HKLM:\SOFTWARE\Valve\Steam',
+        'HKCU:\SOFTWARE\Valve\Steam'
+    )) {
+        try { $value = Get-ItemProperty $key -ErrorAction Stop } catch { continue }
+        foreach ($name in @('InstallPath', 'SteamPath')) {
+            if ($value.PSObject.Properties.Name -contains $name -and
+                $value.$name) {
+                $registeredRoot = [string]$value.$name
+                if ((Test-Path -LiteralPath (
+                        Join-Path $registeredRoot 'steam.exe') -PathType Leaf) -or
+                    (Test-Path -LiteralPath (
+                        Join-Path $registeredRoot (
+                            'steamapps\libraryfolders.vdf')) -PathType Leaf)) {
+                    Add-UniqueFearVrPath $roots $registeredRoot
+                }
+            }
+        }
+        if ($value.PSObject.Properties.Name -contains 'SteamExe' -and
+            $value.SteamExe) {
+            try {
+                $registeredExe = ([string]$value.SteamExe).Trim('"')
+                if (Test-Path -LiteralPath $registeredExe -PathType Leaf) {
+                    Add-UniqueFearVrPath $roots (
+                        Split-Path -Parent $registeredExe)
+                }
+            } catch { }
+        }
+    }
+
+    if ($roots.Count -eq 0) {
+        try {
+            foreach ($process in @(Get-Process -Name steam -ErrorAction Stop)) {
+                if ($process.Path) {
+                    Add-UniqueFearVrPath $roots (Split-Path -Parent $process.Path)
+                }
+            }
+        } catch { }
+    }
+
+    if ($roots.Count -eq 0) {
+        foreach ($drive in (Get-LocalDriveRoots)) {
+            foreach ($relative in @(
+                'Program Files (x86)\Steam',
+                'Program Files\Steam',
+                'Games\Steam',
+                'Steam'
+            )) {
+                $candidate = [IO.Path]::Combine($drive + '\', $relative)
+                if ((Test-Path -LiteralPath (Join-Path $candidate 'steam.exe') `
+                        -PathType Leaf) -or
+                    (Test-Path -LiteralPath (
+                        Join-Path $candidate 'steamapps\libraryfolders.vdf') `
+                        -PathType Leaf)) {
+                    Add-UniqueFearVrPath $roots $candidate
+                }
+            }
+        }
+    }
+    return $roots
+}
+
+function Get-SteamExecutable {
+    foreach ($root in (Get-SteamInstallRoots)) {
+        $candidate = Join-Path $root 'steam.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+# Liefert die Steam-Wurzel und jede zusaetzliche Bibliothek aus
+# libraryfolders.vdf. Der optionale Parameter macht die Pfadsuche mit einer
+# synthetischen Steam-Installation testbar.
+function Get-SteamLibraryRoots([string[]]$SteamRoots) {
+    if ($null -eq $SteamRoots -or $SteamRoots.Count -eq 0) {
+        $SteamRoots = @(Get-SteamInstallRoots)
+    }
+    $libraries = New-Object Collections.Generic.List[string]
+    foreach ($steamRoot in $SteamRoots) {
+        Add-UniqueFearVrPath $libraries $steamRoot
+        $vdf = Join-Path $steamRoot 'steamapps\libraryfolders.vdf'
+        if (-not (Test-Path -LiteralPath $vdf -PathType Leaf)) { continue }
+        try { $vdfText = [IO.File]::ReadAllText($vdf) } catch { continue }
+        foreach ($match in [Text.RegularExpressions.Regex]::Matches(
+            $vdfText, '"path"\s*"([^"]+)"')) {
+            $path = $match.Groups[1].Value -replace '\\\\', '\'
+            Add-UniqueFearVrPath $libraries $path
+        }
+    }
+    return $libraries
+}
+
+# SteamVR ist App 250820. Das Appmanifest liefert den tatsaechlichen
+# Installationsordner; "SteamVR" bleibt der Rueckfall fuer normale
+# Installationen und fehlende/alte Manifeste.
+function Get-SteamVrInstallRoots([string[]]$SteamRoots) {
+    $installRoots = New-Object Collections.Generic.List[string]
+    foreach ($library in @(Get-SteamLibraryRoots $SteamRoots)) {
+        $folderNames = New-Object Collections.Generic.List[string]
+        $appManifest = Join-Path $library 'steamapps\appmanifest_250820.acf'
+        if (Test-Path -LiteralPath $appManifest -PathType Leaf) {
+            try { $appText = [IO.File]::ReadAllText($appManifest) } catch {
+                $appText = ''
+            }
+            $match = [Text.RegularExpressions.Regex]::Match(
+                $appText, '"installdir"\s*"([^"]+)"')
+            if ($match.Success) { $folderNames.Add($match.Groups[1].Value) }
+        }
+        if ('SteamVR' -notin $folderNames) { $folderNames.Add('SteamVR') }
+        foreach ($folderName in $folderNames) {
+            Add-UniqueFearVrPath $installRoots (
+                Join-Path $library "steamapps\common\$folderName")
+        }
+    }
+    return $installRoots
+}
+
+function Find-SteamVrManifest([string[]]$SteamRoots) {
+    foreach ($installRoot in @(Get-SteamVrInstallRoots $SteamRoots)) {
+        $manifest = Join-Path $installRoot 'steamxr_win64.json'
+        if (Test-Path -LiteralPath $manifest -PathType Leaf) {
+            return $manifest
+        }
+    }
+    return $null
+}
+
 # Installationsorte aus der Uninstall-Registry. Deckt GOG, die alte
 # Retail-DVD und jede Neuinstallation an einem ungewöhnlichen Ort ab, ohne
 # das Dateisystem durchsuchen zu müssen.
@@ -189,37 +347,7 @@ function Get-RegistryInstallLocations([string]$NamePattern) {
 function Find-RetailRoot {
     $cfg = Get-FearVrReleaseConfig
     $candidates = New-Object Collections.Generic.List[string]
-    $steamRoot = $null
-    foreach ($key in @(
-        'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam',
-        'HKLM:\SOFTWARE\Valve\Steam',
-        'HKCU:\SOFTWARE\Valve\Steam'
-    )) {
-        try {
-            $value = (Get-ItemProperty $key -ErrorAction Stop)
-            foreach ($name in @('InstallPath', 'SteamPath')) {
-                if ($value.PSObject.Properties.Name -contains $name -and
-                    $value.$name) {
-                    $steamRoot = $value.$name
-                    break
-                }
-            }
-        } catch { }
-        if ($steamRoot) { break }
-    }
-    if (-not $steamRoot) { $steamRoot = 'C:\Program Files (x86)\Steam' }
-
-    $libraries = New-Object Collections.Generic.List[string]
-    $libraries.Add($steamRoot)
-    $vdf = Join-Path $steamRoot 'steamapps\libraryfolders.vdf'
-    if (Test-Path -LiteralPath $vdf -PathType Leaf) {
-        foreach ($match in [Text.RegularExpressions.Regex]::Matches(
-            [IO.File]::ReadAllText($vdf), '"path"\s*"([^"]+)"')) {
-            # Die Klammern sind noetig: In einem Methodenaufruf wuerde das
-            # Komma von -replace sonst als Argumenttrenner gelesen.
-            $libraries.Add(($match.Groups[1].Value -replace '\\\\', '\'))
-        }
-    }
+    $libraries = @(Get-SteamLibraryRoots)
     $gameFolders = @(
         'FEAR Ultimate Shooter Edition',
         'FEAR',
@@ -293,25 +421,6 @@ function Get-RetailLaunchMode([string]$RetailRoot) {
         return 'steam'
     }
     return 'direct'
-}
-
-function Get-SteamExecutable {
-    foreach ($key in @(
-        'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam',
-        'HKLM:\SOFTWARE\Valve\Steam',
-        'HKCU:\SOFTWARE\Valve\Steam'
-    )) {
-        try { $value = Get-ItemProperty $key -ErrorAction Stop } catch { continue }
-        foreach ($name in @('InstallPath', 'SteamPath')) {
-            if ($value.PSObject.Properties.Name -contains $name -and $value.$name) {
-                $exe = Join-Path $value.$name 'steam.exe'
-                if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
-            }
-        }
-    }
-    $default = Join-Path ${env:ProgramFiles(x86)} 'Steam\steam.exe'
-    if (Test-Path -LiteralPath $default -PathType Leaf) { return $default }
-    return $null
 }
 
 # Liefert die typischen Installationswurzeln auf allen angegebenen Laufwerken.
@@ -447,13 +556,13 @@ function Get-OpenXrRuntimeKind([string]$ManifestPath) {
 
 function Resolve-OpenXrRuntime([string]$Runtime) {
     $cfg = Get-FearVrReleaseConfig
+    $activePath = $null
+    try {
+        $activePath = (Get-ItemProperty 'HKLM:\SOFTWARE\Khronos\OpenXR\1' `
+            -ErrorAction Stop).ActiveRuntime
+    } catch { }
     if ([string]::IsNullOrWhiteSpace($Runtime) -or $Runtime -eq 'active') {
-        $path = $null
-        try {
-            $path = (Get-ItemProperty 'HKLM:\SOFTWARE\Khronos\OpenXR\1' `
-                -ErrorAction Stop).ActiveRuntime
-        } catch { }
-        if ([string]::IsNullOrWhiteSpace($path)) {
+        if ([string]::IsNullOrWhiteSpace($activePath)) {
             throw @'
 Keine aktive OpenXR-Runtime gefunden.
 SteamVR oder den Virtual Desktop Streamer starten und dort als OpenXR-Runtime
@@ -461,16 +570,33 @@ setzen, oder mit -Runtime steamvr bzw. -Runtime vdxr starten.
 '@
         }
         return [pscustomobject]@{
-            Path = $null; Name = Get-OpenXrRuntimeName $path
-            Kind = Get-OpenXrRuntimeKind $path; Override = $false
+            Path = $null; Name = Get-OpenXrRuntimeName $activePath
+            Kind = Get-OpenXrRuntimeKind $activePath; Override = $false
         }
     }
     $manifest = switch ($Runtime) {
-        'steamvr' { $cfg.SteamVrManifest }
+        'steamvr' {
+            if (-not [string]::IsNullOrWhiteSpace($activePath) -and
+                (Test-Path -LiteralPath $activePath -PathType Leaf) -and
+                (Get-OpenXrRuntimeKind $activePath) -eq 'steamvr') {
+                $activePath
+            } else {
+                $found = Find-SteamVrManifest
+                if ($found) { $found } else { $null }
+            }
+        }
         'vdxr'    { $cfg.VdxrManifest }
         default   { $Runtime }
     }
-    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+    if ([string]::IsNullOrWhiteSpace($manifest) -and $Runtime -eq 'steamvr') {
+        throw @'
+SteamVR wurde weder als aktive OpenXR-Runtime noch in einer registrierten
+Steam-Bibliothek gefunden. Steam einmal starten oder den vollstaendigen Pfad
+zu steamxr_win64.json mit -Runtime "<Pfad>" angeben.
+'@
+    }
+    if ([string]::IsNullOrWhiteSpace($manifest) -or
+        -not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
         throw "OpenXR-Runtime-Manifest nicht gefunden: $manifest"
     }
     return [pscustomobject]@{

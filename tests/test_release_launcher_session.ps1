@@ -71,6 +71,41 @@ foreach ($removedHelper in @(
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) (
     'fearvr-ui-test-' + [Guid]::NewGuid().ToString('N'))
 try {
+    # Steam und SteamVR duerfen auf einer beliebigen Bibliothek liegen. Die
+    # Fixture nutzt absichtlich einen vom Standardnamen abweichenden
+    # installdir aus SteamVRs Appmanifest.
+    $steamRoot = Join-Path $testRoot 'steam-client'
+    $steamLibrary = Join-Path $testRoot 'other-drive-library'
+    $steamApps = Join-Path $steamRoot 'steamapps'
+    $librarySteamApps = Join-Path $steamLibrary 'steamapps'
+    New-Item -ItemType Directory -Force -Path $steamApps | Out-Null
+    New-Item -ItemType Directory -Force -Path $librarySteamApps | Out-Null
+    $escapedLibrary = $steamLibrary.Replace('\', '\\')
+    [IO.File]::WriteAllText(
+        (Join-Path $steamApps 'libraryfolders.vdf'),
+        '"libraryfolders" { "1" { "path" "' + $escapedLibrary + '" } }')
+    [IO.File]::WriteAllText(
+        (Join-Path $librarySteamApps 'appmanifest_250820.acf'),
+        '"AppState" { "appid" "250820" "installdir" "Valve SteamVR" }')
+    $steamVrRoot = Join-Path $steamLibrary (
+        'steamapps\common\Valve SteamVR')
+    New-Item -ItemType Directory -Force -Path $steamVrRoot | Out-Null
+    $steamVrManifest = Join-Path $steamVrRoot 'steamxr_win64.json'
+    [IO.File]::WriteAllText(
+        $steamVrManifest, '{"runtime":{"name":"SteamVR"}}')
+
+    $foundLibraries = @(
+        Get-SteamLibraryRoots -SteamRoots @($steamRoot))
+    if ($steamLibrary -notin $foundLibraries) {
+        throw "Steam library on another drive was not discovered: $steamLibrary"
+    }
+    $foundSteamVrManifest =
+        Find-SteamVrManifest -SteamRoots @($steamRoot)
+    if ($foundSteamVrManifest -ne $steamVrManifest) {
+        throw ("SteamVR manifest in another library was not discovered. " +
+               "Expected '$steamVrManifest', got '$foundSteamVrManifest'.")
+    }
+
     $sourceGame = Join-Path $testRoot 'source'
     $destinationGame = Join-Path $testRoot 'destination'
     $relativeRecord =

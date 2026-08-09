@@ -344,23 +344,13 @@ function Write-LauncherEvent(
 }
 
 function Find-SteamVrCommand([string]$SteamExecutable) {
-    if ([string]::IsNullOrWhiteSpace($SteamExecutable)) {
-        return $null
+    $steamRoots = if ([string]::IsNullOrWhiteSpace($SteamExecutable)) {
+        $null
+    } else {
+        @(Split-Path -Parent $SteamExecutable)
     }
-    $steamRoot = Split-Path -Parent $SteamExecutable
-    $libraries = New-Object Collections.Generic.List[string]
-    $libraries.Add($steamRoot)
-    $libraryConfig = Join-Path $steamRoot 'steamapps\libraryfolders.vdf'
-    if (Test-Path -LiteralPath $libraryConfig -PathType Leaf) {
-        foreach ($match in [Text.RegularExpressions.Regex]::Matches(
-            [IO.File]::ReadAllText($libraryConfig),
-            '"path"\s*"([^"]+)"')) {
-            $libraries.Add(($match.Groups[1].Value -replace '\\\\', '\'))
-        }
-    }
-    foreach ($library in $libraries) {
-        $candidate = Join-Path $library (
-            'steamapps\common\SteamVR\bin\win64\vrcmd.exe')
+    foreach ($installRoot in @(Get-SteamVrInstallRoots $steamRoots)) {
+        $candidate = Join-Path $installRoot 'bin\win64\vrcmd.exe'
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
             return $candidate
         }

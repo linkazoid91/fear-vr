@@ -82,6 +82,12 @@ no file is copied into Windows or SteamVR. The archive is marked
 Runtime selection is process-local through `XR_RUNTIME_JSON`; no global OpenXR
 setting is changed.
 
+For `-Runtime steamvr`, the launcher checks the active OpenXR manifest,
+Steam's registered install directory, every entry in
+`steamapps\libraryfolders.vdf`, and SteamVR's app manifest. Steam and SteamVR
+therefore do not need to be installed on `C:`. Supplying the complete manifest
+path still works as shown above.
+
 `Install.cmd` passes any extra arguments straight through, so
 `Install.cmd -InstallDir "D:\Games\FearVR"` works the same way.
 
